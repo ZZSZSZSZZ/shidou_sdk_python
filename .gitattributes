@@ -1,0 +1,4 @@
+# Text is normalized to LF on commit; the prebuilt shared objects are
+# stored verbatim — never let git rewrite a binary.
+* text=auto eol=lf
+*.so binary

@@ -1,0 +1,108 @@
+name: ci
+
+# Validates the committed prebuilt payload on both architectures. Each leg
+# runs on the architecture it ships, so the aarch64 object is loaded and
+# exercised for real here -- a development x86_64 host cannot do that.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    name: import and smoke (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-22.04, platform: linux }
+          - { os: ubuntu-22.04-arm, platform: linux-arm64 }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assert runner architecture
+        shell: bash
+        run: |
+          set -eu
+          machine=$(uname -m)
+          case "${{ matrix.platform }}" in
+            linux) expected=x86_64 ;;
+            linux-arm64) expected=aarch64 ;;
+          esac
+          if [ "$machine" != "$expected" ]; then
+            echo "runner is $machine, this leg ships $expected"
+            exit 1
+          fi
+
+      - name: Assert the payload resolves beside itself
+        shell: bash
+        run: |
+          set -eu
+          libdir="shidou/_lib/${{ matrix.platform }}"
+          test -f "$libdir/libshidou_py.so"
+          test -f "$libdir/libzenohc.so"
+          readelf -d "$libdir/libshidou_py.so" | grep -F '(RUNPATH)'
+          readelf -d "$libdir/libshidou_py.so" | grep -F '$ORIGIN'
+
+      - name: Smoke without pip
+        shell: bash
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: python3 tests/smoke.py
+
+      - name: Editable install
+        shell: bash
+        run: |
+          set -eu
+          if ! python3 -m venv .venv; then
+            # The image ships python3 but not always python3-venv.
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq python3-venv
+            python3 -m venv .venv
+          fi
+          # A distro venv seeds an old pip, and an old pip cannot build with a
+          # current setuptools: it reports the backend as missing the
+          # build_editable hook.
+          .venv/bin/python -m pip install --quiet --upgrade pip
+          .venv/bin/pip install --quiet -e .
+
+      - name: Smoke from the installed package, outside the tree
+        shell: bash
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -eu
+          "$GITHUB_WORKSPACE/.venv/bin/python" -c "import shidou; print(shidou.__file__)"
+          "$GITHUB_WORKSPACE/.venv/bin/python" "$GITHUB_WORKSPACE/tests/smoke.py"
+
+      - name: Examples parse
+        shell: bash
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          set -eu
+          for name in get_state get_joint set_fsm mit_control pushrod_control chassis_control; do
+            python3 "examples/$name.py" --help > /dev/null
+          done
+
+      - name: Wheel carries both payloads
+        shell: bash
+        run: |
+          set -eu
+          .venv/bin/pip wheel --quiet --no-deps --wheel-dir dist .
+          .venv/bin/python - <<'PY'
+          import glob
+          import zipfile
+          names = zipfile.ZipFile(glob.glob("dist/*.whl")[0]).namelist()
+          for slug in ("linux", "linux-arm64"):
+              for name in ("libshidou_py.so", "libzenohc.so"):
+                  member = "shidou/_lib/{}/{}".format(slug, name)
+                  assert member in names, "missing " + member
+          print("wheel carries both payloads")
+          PY

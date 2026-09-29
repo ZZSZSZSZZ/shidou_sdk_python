@@ -1,0 +1,8 @@
+# The prebuilt shared objects under shidou/_lib/ are the payload and are
+# committed: *.so is deliberately NOT ignored here.
+build/
+dist/
+*.egg-info/
+__pycache__/
+.venv/
+*.whl

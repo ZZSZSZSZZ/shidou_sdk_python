@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "shidou-sdk"
+version = "1.0.0"
+description = "Python client for ShiDou robots over the Zenoh bridge"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { file = "LICENSE" }
+dependencies = []
+
+[tool.setuptools]
+# Explicit: the tree also carries examples/ and tests/, which a
+# flat-layout scan would try to collect as packages.
+packages = ["shidou"]
+zip-safe = false
+
+[tool.setuptools.package-data]
+# The prebuilt payloads, one directory per architecture. Runtime picks by
+# platform.machine(); both are in this package, so a plain install carries
+# both.
+shidou = ["_lib/*/*"]

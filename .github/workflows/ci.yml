@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   smoke:
-    name: import and smoke (${{ matrix.platform }})
+    name: import and peer-mode check (${{ matrix.platform }})
     strategy:
       fail-fast: false
       matrix:
@@ -51,11 +51,31 @@ jobs:
           readelf -d "$libdir/libshidou_py.so" | grep -F '(RUNPATH)'
           readelf -d "$libdir/libshidou_py.so" | grep -F '$ORIGIN'
 
-      - name: Smoke without pip
+      - name: Peer-mode check without pip
         shell: bash
         env:
           PYTHONPATH: ${{ github.workspace }}
-        run: python3 tests/smoke.py
+        run: |
+          set -eu
+          # The payload ships no tests; this exercises the committed object
+          # and the package around it directly. Peer mode needs no robot and
+          # no bridge, but still opens a session and builds every comm object.
+          python3 - <<'PY'
+          import shidou
+
+          robot = shidou.Robot(shidou.Config(robot_address="", mode="peer",
+                                             enable_scouting=False))
+          assert robot.ready, "peer-mode session did not come up"
+          assert robot.last_feedback() is None
+          assert robot.feedback_age_ms == -1.0 and robot.feedback_seq == 0
+          assert robot.fsm_state == ""
+          assert not robot.send_mit(motor_ids=[1, 2], positions=[0.1]), \
+              "arrays out of alignment were accepted"
+          assert "positions" in robot.last_error()
+          assert robot.send_mit(motor_ids=[1, 2], positions=[0.0, 0.0]), \
+              "a well-formed frame was refused"
+          print("payload imported and came up in peer mode")
+          PY
 
       - name: Editable install
         shell: bash
@@ -73,13 +93,20 @@ jobs:
           .venv/bin/python -m pip install --quiet --upgrade pip
           .venv/bin/pip install --quiet -e .
 
-      - name: Smoke from the installed package, outside the tree
+      - name: Import from the installed package, outside the tree
         shell: bash
         working-directory: ${{ runner.temp }}
         run: |
           set -eu
-          "$GITHUB_WORKSPACE/.venv/bin/python" -c "import shidou; print(shidou.__file__)"
-          "$GITHUB_WORKSPACE/.venv/bin/python" "$GITHUB_WORKSPACE/tests/smoke.py"
+          "$GITHUB_WORKSPACE/.venv/bin/python" - <<'PY'
+          import shidou
+
+          print(shidou.__file__)
+          robot = shidou.Robot(shidou.Config(robot_address="", mode="peer",
+                                             enable_scouting=False))
+          assert robot.ready, "peer-mode session did not come up"
+          print("installed package came up in peer mode")
+          PY
 
       - name: Examples parse
         shell: bash

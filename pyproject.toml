@@ -12,8 +12,8 @@ license = { file = "LICENSE" }
 dependencies = []
 
 [tool.setuptools]
-# Explicit: the tree also carries examples/ and tests/, which a
-# flat-layout scan would try to collect as packages.
+# Explicit: the tree also carries examples/, which a flat-layout scan
+# would try to collect as a package.
 packages = ["shidou"]
 zip-safe = false
 

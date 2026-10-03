@@ -11,7 +11,6 @@ shidou/                    # Python 包；_lib/<platform>/ 下是随包发布的
   _lib/linux-arm64/        # aarch64（同上）
 examples/                  # 控制示例（get_state / get_joint / set_fsm /
                            # mit_control / pushrod_control / chassis_control）
-tests/smoke.py             # 冒烟：不连机器人（peer 模式自建会话），19 项检查
 pyproject.toml             # 打包元数据（pip 用）
 ```
 

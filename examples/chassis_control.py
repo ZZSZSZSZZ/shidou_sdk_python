@@ -19,8 +19,8 @@
 # namespace 时显式传空串：chassis_control.py <ip>:<port> ""
 #
 # 本示例会让机器人真的移动：确认处放弃即什么都不下发，运行前先清场。
-# 真机上不要用 with、也不要调 close()：销毁带流量的句柄有已知缺陷，进程退出即可
-# （原因与例外见 README）。
+# 句柄不显式关闭，进程退出时随进程回收；需要提前释放时可正常 close()/with（v1.0.1 起，
+# 此前版本的例外说明见 README）。
 
 import argparse
 import sys

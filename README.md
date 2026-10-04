@@ -89,7 +89,7 @@ shidou.init_logging("info")
 # ns 必须与机器人侧桥配置的 namespace 完全一致；桥未启用时显式传 ""
 config = shidou.Config(robot_address="192.168.168.168:7447", ns="robot168")
 
-robot = shidou.Robot(config)                    # 真机上不要用 with、也不要 close()，见下
+robot = shidou.Robot(config)                    # 句柄生命周期见「注意事项」
 robot.enable()                                  # ENABLED 握手（阻塞）
 robot.set_mode(shidou.ControlMode.POSITION)     # 模式命令要求已 ENABLED
 robot.send_position(motor_ids=[1, 2], positions=[0.1, 0.1])
@@ -123,9 +123,9 @@ robot.set_stale_callback(lambda age_ms: print("stale", age_ms), threshold_ms=100
 - 预编译载荷均为 Ubuntu 22.04 构建（glibc ≥ 2.35）：`shidou/_lib/` 下的 `linux` 与
   `linux-arm64` 一架构一目录、不可混用；本机架构没有对应载荷、或包不完整时，import
   会给出明确的 `ImportError`（`SHIDOU_LIB` 可指定别处的 `.so`）
-- **真机例外**：机器人上 `joint_states` 持续在发，而销毁带流量的句柄有已知缺陷
-  （崩溃点在 `close()`，C++ 侧既有问题）——真机上不要用 `with`、也不要调 `close()`，
-  让进程自己结束（仓库里的示例都遵守这一条）
+- **句柄生命周期**：进程退出时句柄随之释放（仓库里的示例都不显式 `close()`，需要提前
+  释放时可正常 `close()` 或用 `with`）。v1.0.1 起销毁带流量的句柄已安全；**v1.0.0 及
+  更早的载荷**仍有析构崩溃缺陷，请继续回避（不调 `close()`，让进程自己结束）
 - `last_error()` 是**粘性**的（成功不清空）；`send_*` 失败本身不写错误文本。判断成败
   请看返回值/异常，而不是错误文本是否为空
 - `Robot` 是进程级单例：第二个配置不同的 `Robot` 会一直是 `ready == False`。多机器人

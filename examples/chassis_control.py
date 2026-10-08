@@ -12,17 +12,17 @@
 # 轮组只在 POSITION 态生效，其余状态下发会被强制归零。轮组反馈随 joint_states 到达，
 # 按 motor_id 与顶杆区分（轮组 rad 与 rad/s）。收尾故意停发一段：超过死区窗口后轮速
 # 应自行归零，不靠显式零速指令；只有仍未归零时才补发零速兜底。
-# send_* 的失败不写错误文本（见 README），失败时只报结果。
+# send_* 失败返回 False（不抛异常）；失败的那一帧之后，last_error() 就是本次调用的消息。
 #
 # 用法：chassis_control.py [<ip>:<port>] [namespace]
 # namespace 须与机器人侧桥配置的 namespace 完全一致（缺省 robot168）；桥未启用
 # namespace 时显式传空串：chassis_control.py <ip>:<port> ""
+# 用法与缺省值也可以直接问示例：chassis_control.py --help
 #
 # 本示例会让机器人真的移动：确认处放弃即什么都不下发，运行前先清场。
 # 句柄不显式关闭，进程退出时随进程回收；需要提前释放时可正常 close()/with（v1.0.1 起，
 # 此前版本的例外说明见 README）。
 
-import argparse
 import sys
 import time
 
@@ -99,26 +99,14 @@ def print_wheel_feedback(robot, expected_vel):
     return off
 
 
-def main():
-    parser = argparse.ArgumentParser(description="驱动底盘轮组走一段正转/停/反转并判定反馈。")
-    parser.add_argument("address", nargs="?", default="192.168.168.168:7447",
-                        help="机器人侧 zenoh 桥的 <ip>:<port>（缺省 192.168.168.168:7447）")
-    parser.add_argument("namespace", nargs="?", default="robot168",
-                        help="keyexpr 前缀，须与桥配置一致；桥未启用前缀时传空串")
-    args = parser.parse_args()
-
-    shidou.init_logging("info")
-    robot = shidou.Robot(shidou.Config(robot_address=args.address, ns=args.namespace))
-    if not robot.ready:
-        print("[FAIL] {}".format(robot.last_error()))
-        return 1
-
+def drive_chassis(robot, cfg, verdicts):
+    """动作序列：确认计划 → 三段轮速（斜坡 + 保持）→ 死区用例 → 切回 ENABLED。"""
     try:
         state = robot.get_state()
     except shidou.ShidouError as error:
-        print("[FAIL] get_state: {}".format(error))
+        verdicts.fail("get_state: {}".format(error))
         shidou.shutdown()
-        return 1
+        return
     print("fsm_state={}".format(state.fsm_state))
 
     # 模式命令只能从 ENABLED 发起（STOP 态只接受 enable，不能直接切模式）。
@@ -126,18 +114,18 @@ def main():
         try:
             robot.enable()
         except shidou.ShidouError as error:
-            print("[FAIL] enable: {}".format(error))
+            verdicts.fail("enable: {}".format(error))
             shidou.shutdown()
-            return 1
+            return
         print("fsm_state={}".format(robot.fsm_state))
 
     # 轮组只在 POSITION 态生效：切模式并确认后再发轮速。
     try:
         robot.set_mode(shidou.ControlMode.POSITION)
     except shidou.ShidouError as error:
-        print("[FAIL] set_mode(POSITION): {}".format(error))
+        verdicts.fail("set_mode(POSITION): {}".format(error))
         shidou.shutdown()
-        return 1
+        return
     print("fsm_state={}".format(robot.fsm_state))
 
     planned = sum(RAMP_SECONDS + hold for _, _, hold in SEGMENTS)
@@ -149,7 +137,7 @@ def main():
     if not common.wait_enter("press Enter to start, Ctrl+C to exit"):
         print("aborted, nothing was commanded")
         shidou.shutdown()
-        return 0
+        return
 
     wheels_ok = True  # 任一段或死区用例的轮速判定失败即置 False
     previous = 0.0
@@ -163,14 +151,14 @@ def main():
             if elapsed >= RAMP_SECONDS:
                 break
             if not send_wheels(robot, previous + (speed - previous) * (elapsed / RAMP_SECONDS)):
-                print("[FAIL] send_body failed")
+                verdicts.fail("send_body: {}".format(robot.last_error()))
                 shidou.shutdown()
-                return 1
+                return
             time.sleep(PERIOD_S)
         if not publish_loop(robot, speed, hold):
-            print("[FAIL] send_body failed")
+            verdicts.fail("send_body: {}".format(robot.last_error()))
             shidou.shutdown()
-            return 1
+            return
         if print_wheel_feedback(robot, speed) > 0:
             wheels_ok = False
         previous = speed
@@ -184,23 +172,26 @@ def main():
     if deadman_off > 0:
         wheels_ok = False
         if not publish_loop(robot, 0.0, STOP_SECONDS):
-            print("[FAIL] send_body failed")
+            verdicts.fail("send_body: {}".format(robot.last_error()))
             shidou.shutdown()
-            return 1
+            return
 
     # 切回 ENABLED，机器人回到可再次接收模式命令的状态。
     try:
         robot.enable()
     except shidou.ShidouError as error:
         shidou.shutdown()
-        print("[FAIL] enable: {}".format(error))
-        return 1
+        verdicts.fail("enable: {}".format(error))
+        return
     shidou.shutdown()
-    print("[PASS] Enable -> fsm_state={}".format(robot.fsm_state))
+    verdicts.pass_("Enable -> fsm_state={}".format(robot.fsm_state))
     if not wheels_ok:
-        print("[FAIL] wheel velocities off target (see above)")
-        return 1
-    return 0
+        verdicts.fail("wheel velocities off target (see above)")
+
+
+def main():
+    # 底盘控制没有自己的参数：位置参数只有 [<ip>:<port>] 与 [namespace]。
+    return common.run([], drive_chassis)
 
 
 if __name__ == "__main__":

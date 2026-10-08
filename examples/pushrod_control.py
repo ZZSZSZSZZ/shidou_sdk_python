@@ -12,17 +12,17 @@
 #
 # 起点取反馈里的当前位置，所以**没有反馈样本时示例不动电机**并直接退出——不盲发目标。
 # 目标位置的物理含义（哪一端是零点、位置增大朝哪走）由机器人端定义，示例只负责填参数。
-# send_* 的失败不写错误文本（见 README），失败时只报结果。
+# send_* 失败返回 False（不抛异常）；失败的那一帧之后，last_error() 就是本次调用的消息。
 #
 # 用法：pushrod_control.py [target_mm] [<ip>:<port>] [namespace]
 # target_mm 为目标位置参数（mm，绝对值，填多少就走到哪），缺省 0（零点）。
 # namespace 须与机器人侧桥配置的 namespace 完全一致（缺省 robot168）；桥未启用
 # namespace 时显式传空串：pushrod_control.py <target_mm> <ip>:<port> ""
+# 用法与缺省值也可以直接问示例：pushrod_control.py --help
 #
 # 句柄不显式关闭，进程退出时随进程回收；需要提前释放时可正常 close()/with（v1.0.1 起，
 # 此前版本的例外说明见 README）。
 
-import argparse
 import sys
 import time
 
@@ -31,7 +31,6 @@ import shidou
 
 FEEDBACK_PERIOD_S = 0.1        # 到位判据的反馈轮询周期
 PUSHROD_ID = 17                # 顶杆电机号（示例值，按机器人实际配置修改）
-DEFAULT_TARGET_MM = 0.0        # 目标位置参数缺省值（命令行不填时取 0，即零点）
 PROFILE_VELOCITY = 20.0        # 轮廓速度 mm/s（示例值）
 PROFILE_ACCELERATION = 50.0    # 轮廓加速度 mm/s²（示例值）
 POSITION_TOLERANCE_MM = 1.0    # 到位判据：位置差不超过该值即算到位
@@ -98,37 +97,14 @@ def wait_in_position(robot, start_mm, goal_mm):
         time.sleep(FEEDBACK_PERIOD_S)
 
 
-def main():
-    parser = argparse.ArgumentParser(description="使能模式下把顶杆送到目标位置并按反馈判定到位。")
-    parser.add_argument("target_mm", nargs="?", default=None,
-                        help="目标位置参数（mm，绝对值），缺省 0（零点）")
-    parser.add_argument("address", nargs="?", default="192.168.168.168:7447",
-                        help="机器人侧 zenoh 桥的 <ip>:<port>（缺省 192.168.168.168:7447）")
-    parser.add_argument("namespace", nargs="?", default="robot168",
-                        help="keyexpr 前缀，须与桥配置一致；桥未启用前缀时传空串")
-    args = parser.parse_args()
-
-    # 目标位置参数（mm，绝对值）；非法参数直接退出，避免把输入错误当成目标下发给电机。
-    target_mm = DEFAULT_TARGET_MM
-    if args.target_mm is not None:
-        try:
-            target_mm = float(args.target_mm)
-        except ValueError:
-            print("[FAIL] bad target_mm: {} (expected a number in mm)".format(args.target_mm))
-            return 1
-
-    shidou.init_logging("info")
-    robot = shidou.Robot(shidou.Config(robot_address=args.address, ns=args.namespace))
-    if not robot.ready:
-        print("[FAIL] {}".format(robot.last_error()))
-        return 1
-
+def drive_pushrod(robot, cfg, verdicts, target_mm):
+    """单程动作：查询状态 → 必要时 Enable → 读起点 → 等回车 → 下发目标 → 等到位。"""
     try:
         state = robot.get_state()
     except shidou.ShidouError as error:
-        print("[FAIL] get_state: {}".format(error))
+        verdicts.fail("get_state: {}".format(error))
         shidou.shutdown()
-        return 1
+        return
     print("fsm_state={}".format(state.fsm_state))
 
     # 顶杆在 ENABLED 下即可接收目标位置参数，示例全程保持在使能模式，不下发模式切换；
@@ -137,43 +113,63 @@ def main():
         try:
             robot.enable()
         except shidou.ShidouError as error:
-            print("[FAIL] enable: {}".format(error))
+            verdicts.fail("enable: {}".format(error))
             shidou.shutdown()
-            return 1
+            return
         print("fsm_state={}".format(robot.fsm_state))
 
     # 起点只能来自反馈：拿不到就什么都不发（盲发目标可能让顶杆从任意位置起跳）。
     found, start_mm, saw_sample = wait_first_position(robot, PUSHROD_ID)
     if not found:
-        print("[FAIL] no position for pushrod motor {} in {:.0f} s ({}): "
-              "nothing was commanded".format(
-                  PUSHROD_ID, FEEDBACK_WAIT_S,
-                  "feedback has no such motor" if saw_sample else "no feedback sample"))
+        verdicts.fail("no position for pushrod motor {} in {:.0f} s ({}): "
+                      "nothing was commanded".format(
+                          PUSHROD_ID, FEEDBACK_WAIT_S,
+                          "feedback has no such motor" if saw_sample else "no feedback sample"))
         shidou.shutdown()
-        return 1
+        return
 
     print("plan: pushrod {} {:.2f} mm -> {:.2f} mm (profile {:.0f} mm/s, {:.0f} mm/s^2)".format(
         PUSHROD_ID, start_mm, target_mm, PROFILE_VELOCITY, PROFILE_ACCELERATION))
     if not common.wait_enter("press Enter to start, Ctrl+C to exit"):
         print("aborted, nothing was commanded")
         shidou.shutdown()
-        return 0
+        return
 
     if not send_pushrod(robot, target_mm):
-        print("[FAIL] send_body failed")
+        verdicts.fail("send_body: {}".format(robot.last_error()))
         shidou.shutdown()
-        return 1
+        return
     reached, measured = wait_in_position(robot, start_mm, target_mm)
     if not reached:
-        print("[FAIL] pushrod did not reach {:.2f} mm (measured {:.2f} mm)".format(
+        verdicts.fail("pushrod did not reach {:.2f} mm (measured {:.2f} mm)".format(
             target_mm, measured))
         shidou.shutdown()
-        return 1
-    print("[PASS] pushrod {:.2f} mm -> {:.2f} mm (measured {:.2f} mm)".format(
+        return
+    verdicts.pass_("pushrod {:.2f} mm -> {:.2f} mm (measured {:.2f} mm)".format(
         start_mm, target_mm, measured))
 
     shidou.shutdown()
-    return 0
+
+
+def main():
+    # 目标位置参数（mm，绝对值）。缺省值写在参数声明里，与显式取值走同一条解析路径；
+    # 非法参数走非法调用路径，避免把输入错误当成目标下发给电机。解析结果由这个闭包接走
+    # （与 C++ 侧解析闭包写 `double target_mm` 同形），body 再从闭包取。
+    target_mm = 0.0
+
+    def parse_target_mm(text):
+        nonlocal target_mm
+        target_mm = common.parse_double("target_mm", "a number in mm", text)
+
+    target_arg = common.PositionalArg(
+        "target_mm", "0",
+        "absolute target position in mm; the pushrod moves exactly there",
+        parse_target_mm)
+
+    def body(robot, cfg, verdicts):
+        drive_pushrod(robot, cfg, verdicts, target_mm)
+
+    return common.run([target_arg], body)
 
 
 if __name__ == "__main__":

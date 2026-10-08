@@ -1,7 +1,6 @@
 # ShiDou SDK Python 绑定
 
 使用 Eclipse Zenoh 为底层通信协议、以 ctypes 调用 C++ 实现的 Python 机器人客户端。
-预编译载荷：安装不需要编译器，也不需要联网。
 
 ## 目录结构
 
@@ -97,7 +96,7 @@ robot.send_position(motor_ids=[1, 2], positions=[0.1, 0.1])
 state = robot.get_state()                       # 阻塞，失败抛 ShidouError
 print(state.fsm_state, state.motor_ids, state.positions)
 
-shidou.shutdown()                               # 进程收尾一次
+robot.close()                                   # 释放该句柄打开的会话（也可用 with）
 ```
 
 接口与 C++ SDK 同名同义：`send_mit` / `send_csp` / `send_position` / `send_gripper` /
@@ -120,16 +119,24 @@ robot.set_stale_callback(lambda age_ms: print("stale", age_ms), threshold_ms=100
 
 ## 注意事项
 
-- 预编译载荷均为 Ubuntu 22.04 构建（glibc ≥ 2.35）：`shidou/_lib/` 下的 `linux` 与
-  `linux-arm64` 一架构一目录、不可混用；本机架构没有对应载荷、或包不完整时，import
+- 预编译库由 GitHub Actions 流水线构建（Ubuntu 22.04，glibc ≥ 2.35）：`shidou/_lib/` 下的 `linux` 与
+  `linux-arm64` 一架构一目录、不可混用；本机架构没有对应库、或包不完整时，import
   会给出明确的 `ImportError`（`SHIDOU_LIB` 可指定别处的 `.so`）
-- **句柄生命周期**：进程退出时句柄随之释放（仓库里的示例都不显式 `close()`，需要提前
-  释放时可正常 `close()` 或用 `with`）。v1.0.1 起销毁带流量的句柄已安全；**v1.0.0 及
-  更早的载荷**仍有析构崩溃缺陷，请继续回避（不调 `close()`，让进程自己结束）
-- `last_error()` 是**粘性**的（成功不清空）；`send_*` 失败本身不写错误文本。判断成败
-  请看返回值/异常，而不是错误文本是否为空
-- `Robot` 是进程级单例：第二个配置不同的 `Robot` 会一直是 `ready == False`。多机器人
-  用 `set_namespace` 切换，不要建多个 `Robot`
+- **句柄生命周期**：每个 `Robot` 在创建时打开自己的会话（配置各自生效，同进程可以并存
+  多个句柄），`close()`（含 `with` 退出）在销毁句柄时释放它，只影响自己那一份；不调
+  `close()` 则进程退出时随之释放（仓库里的示例都不显式 `close()`）。`close()` 会同步
+  关闭会话的传输：本地会话毫秒级，机器人地址失联时可能等数秒，因此不要从回调里调用。
+  v1.0.1 起销毁带流量的句柄已安全；**v1.0.0 及更早的版本**仍有析构崩溃缺陷，请继续回避
+  （不调 `close()`，让进程自己结束）
+- `last_error()` 是**最近一次失败**的诊断记录（粘性，成功不清空）；异常文本是**本次
+  调用**的消息，`send_*` 失败时也记录本次原因。创建失败也算一次失败：构造交回的句柄
+  `ready` 为假，`last_error()` 从创建起就是失败原因；随后任何失败的调用都会把这条记录
+  顶掉。判断本次成败请看返回值/异常，而不是错误文本是否为空
+- 同进程建多个 `Robot` 不再是陷阱：每个句柄自带一个会话，配置各自生效（各连各的地址/
+  namespace），`close()` 只释放自己那一份；`shidou.shutdown()` 保留兼容（句柄自持会话后
+  已无操作，随时可调）。连不上不是异常：构造交回的句柄 `ready` 为假，`last_error()` 就是
+  原因（会话打不开给会话自己的原因，通信对象建不起来给 `failed to create comm objects: …`），
+  日志里另有同一原因的 error 行
 - 阻塞方法要等满超时（enable/stop 5 s、mode 2 s、`get_state` 5 s、轨迹 10 s），且只能
   从非回调线程调用；回调里只做拷贝与标记，动作交给主线程
 - `send_*` 与轨迹路点的数组要和 `motor_ids`（或 `joint_id`）逐位对齐，可选数组要么

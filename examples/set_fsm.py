@@ -7,36 +7,28 @@
 # 用法：set_fsm.py [<ip>:<port>] [namespace]
 # namespace 须与机器人侧桥配置的 namespace 完全一致（缺省 robot168）；桥未启用
 # namespace 时显式传空串：set_fsm.py <ip>:<port> ""
+# 用法与缺省值也可以直接问示例：set_fsm.py --help
 #
 # 句柄不显式关闭，进程退出时随进程回收；需要提前释放时可正常 close()/with（v1.0.1 起，
 # 此前版本的例外说明见 README）。
 
-import argparse
 import sys
 
 import example_common as common
 import shidou
 
 
-def main():
-    parser = argparse.ArgumentParser(description="在 STOP 与 ENABLED 之间手动切换。")
-    parser.add_argument("address", nargs="?", default="192.168.168.168:7447",
-                        help="机器人侧 zenoh 桥的 <ip>:<port>（缺省 192.168.168.168:7447）")
-    parser.add_argument("namespace", nargs="?", default="robot168",
-                        help="keyexpr 前缀，须与桥配置一致；桥未启用前缀时传空串")
-    args = parser.parse_args()
+def toggle_fsm(robot, cfg, verdicts):
+    """切换循环：回车切一次，stdin 关闭 / Ctrl+C / Ctrl+Z 退出（见 example_common.py）。
 
-    shidou.init_logging("info")
-    robot = shidou.Robot(shidou.Config(robot_address=args.address, ns=args.namespace))
-    if not robot.ready:
-        print("[FAIL] {}".format(robot.last_error()))
-        return 1
-
+    某次切换失败只记 [FAIL] 并继续接受下一次按键；退出码由判定积累给出，
+    操作者主动退出本身不算失败。
+    """
     try:
         state = robot.get_state()
     except shidou.ShidouError as error:
-        print("[FAIL] get_state: {}".format(error))
-        return 1
+        verdicts.fail("get_state: {}".format(error))
+        return
     # 初始不是 STOP（ENABLED 或任一控制模式）时，第一次按键先 Stop。
     stopped = state.fsm_state == "STOP"
     print("current fsm_state={}".format(state.fsm_state))
@@ -48,7 +40,7 @@ def main():
         if not common.wait_enter():
             print("toggled {} times, final fsm_state={}".format(toggles, robot.fsm_state))
             shidou.shutdown()
-            return 0
+            return
         action = "Enable" if stopped else "Stop"
         try:
             if stopped:
@@ -56,11 +48,16 @@ def main():
             else:
                 robot.stop()
         except shidou.ShidouError as error:
-            print("[FAIL] {}: {} (state unchanged)".format(action, error))
+            verdicts.fail("{}: {} (state unchanged)".format(action, error))
             continue
         stopped = robot.fsm_state == "STOP"
         toggles += 1
-        print("[PASS] {} -> fsm_state={}".format(action, robot.fsm_state))
+        verdicts.pass_("{} -> fsm_state={}".format(action, robot.fsm_state))
+
+
+def main():
+    # FSM 切换没有自己的参数：位置参数只有 [<ip>:<port>] 与 [namespace]。
+    return common.run([], toggle_fsm)
 
 
 if __name__ == "__main__":

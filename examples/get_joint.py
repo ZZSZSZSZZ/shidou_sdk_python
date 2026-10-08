@@ -10,15 +10,16 @@
 # 用法：get_joint.py [seconds] [<ip>:<port>] [namespace]
 # namespace 须与机器人侧桥配置的 namespace 完全一致（缺省 robot168）；桥未启用
 # namespace 时显式传空串：get_joint.py <seconds> <ip>:<port> ""
+# 用法与缺省值也可以直接问示例：get_joint.py --help
 #
 # 句柄不显式关闭，进程退出时随进程回收；需要提前释放时可正常 close()/with（v1.0.1 起，
 # 此前版本的例外说明见 README）。
 
-import argparse
 import sys
 import threading
 import time
 
+import example_common as common
 import shidou
 
 PRINT_INTERVAL_S = 0.5
@@ -41,25 +42,9 @@ def print_snapshot(feedback, seq, age_ms, fsm, stale):
                   motor_id, position, velocity, effort, temperature, fault, online))
 
 
-def main():
-    parser = argparse.ArgumentParser(description="订阅关节遥测并周期打印快照。")
-    parser.add_argument("seconds", nargs="?", type=float, default=10.0,
-                        help="遥测时长（秒）；0 或负数表示一直运行到进程被杀")
-    parser.add_argument("address", nargs="?", default="192.168.168.168:7447",
-                        help="机器人侧 zenoh 桥的 <ip>:<port>（缺省 192.168.168.168:7447）")
-    parser.add_argument("namespace", nargs="?", default="robot168",
-                        help="keyexpr 前缀，须与桥配置一致；桥未启用前缀时传空串")
-    args = parser.parse_args()
-
-    # 监控进程在 stdout 被重定向到文件时也必须即时打印。
-    sys.stdout.reconfigure(line_buffering=True)
-
-    shidou.init_logging("info")
-    robot = shidou.Robot(shidou.Config(robot_address=args.address, ns=args.namespace))
-    if not robot.ready:
-        print("[FAIL] {}".format(robot.last_error()))
-        return 1
-    print("monitoring {} for {:.0f} s (0 = until killed)...".format(args.address, args.seconds))
+def monitor_joints(robot, cfg, verdicts, seconds):
+    """订阅与打印：每 500 ms 打一帧快照，直到 seconds 用完（<= 0 表示一直运行到进程被杀）。"""
+    print("monitoring {} for {:.0f} s (0 = until killed)...".format(cfg.robot_address, seconds))
 
     # 精确接收计数：缓存只保留最新样本，轮询缓存会少算；回调每个样本触发一次。
     # 回调在 zenoh 会话线程上跑，用锁保护计数。
@@ -72,14 +57,14 @@ def main():
 
     robot.set_feedback_callback(on_feedback)
     robot.set_stale_callback(
-        lambda ms: print("[WARN] no telemetry for {:.0f} ms (link or robot node down?)".format(ms)),
+        lambda ms: verdicts.warn("no telemetry for {:.0f} ms (link or robot node down?)".format(ms)),
         threshold_ms=STALE_THRESHOLD_MS)
 
     have_feedback = False
     age_min = 0.0
     age_max = 0.0
     start = time.monotonic()
-    while args.seconds <= 0.0 or time.monotonic() - start < args.seconds:
+    while seconds <= 0.0 or time.monotonic() - start < seconds:
         time.sleep(PRINT_INTERVAL_S)
 
         feedback = robot.last_feedback()
@@ -100,12 +85,36 @@ def main():
     shidou.shutdown()
     samples = received[0]
     if samples == 0:
-        print("[FAIL] no feedback received")
-        return 1
+        verdicts.fail("no feedback received")
+        return
     print("received {} samples in {:.1f} s (~{:.1f} Hz), age {:.1f}..{:.1f} ms".format(
         samples, elapsed, samples / elapsed if elapsed > 0.0 else 0.0, age_min, age_max))
-    print("[PASS] get_joint completed")
-    return 0
+    verdicts.pass_("get_joint completed")
+
+
+def main():
+    # 监控进程在 stdout 被重定向到文件时也必须即时打印（在解析参数之前设置）。
+    sys.stdout.reconfigure(line_buffering=True)
+
+    # 运行时长（秒）；<= 0 表示一直运行到进程被杀。缺省值写在参数声明里，与显式取值
+    # 走同一条解析路径；非数字必须是非法调用——不能静默取 0，那等于把有界监控变成
+    # 一直运行到进程被杀。解析结果由这个闭包接走（与 C++ 侧解析闭包写
+    # `double seconds` 同形），body 再从闭包取。
+    seconds = 0.0
+
+    def parse_seconds(text):
+        nonlocal seconds
+        seconds = common.parse_double("seconds", "a number", text)
+
+    seconds_arg = common.PositionalArg(
+        "seconds", "10",
+        "telemetry duration in seconds; 0 or negative runs until the process is killed",
+        parse_seconds)
+
+    def body(robot, cfg, verdicts):
+        monitor_joints(robot, cfg, verdicts, seconds)
+
+    return common.run([seconds_arg], body)
 
 
 if __name__ == "__main__":

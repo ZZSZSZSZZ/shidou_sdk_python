@@ -3,11 +3,14 @@ name: ci
 # Validates the committed prebuilt payload on both architectures. Each leg
 # runs on the architecture it ships, so the aarch64 object is loaded and
 # exercised for real here -- a development x86_64 host cannot do that.
+# release.yml reuses this definition on tags (workflow_call), so the
+# push-time and tag-time checks cannot drift.
 
 on:
   push:
     branches: [main]
   pull_request:
+  workflow_call:
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -74,6 +77,23 @@ jobs:
           assert "positions" in robot.last_error()
           assert robot.send_mit(motor_ids=[1, 2], positions=[0.0, 0.0]), \
               "a well-formed frame was refused"
+
+          # Every handle opens the session it runs on: a second Robot with a
+          # namespace of its own comes up ready and publishes there, and
+          # closing it leaves the first handle working.
+          second = shidou.Robot(shidou.Config(robot_address="", mode="peer",
+                                              enable_scouting=False, ns="second"))
+          assert second.ready, "a second handle's session did not come up"
+          assert second.send_mit(motor_ids=[1], positions=[0.0]), \
+              "the second handle's session did not publish"
+          second.close()
+          assert robot.ready and robot.send_mit(motor_ids=[1], positions=[0.0]), \
+              "closing one handle disturbed the other"
+
+          # Kept for callers written against older payloads: a no-op now, and
+          # an open handle must be untouched by it.
+          shidou.shutdown()
+          assert robot.ready, "shutdown() disturbed an open handle"
           print("payload imported and came up in peer mode")
           PY
 

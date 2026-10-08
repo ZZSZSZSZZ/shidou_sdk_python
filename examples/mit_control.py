@@ -12,15 +12,16 @@
 # 用法：mit_control.py [<ip>:<port>] [namespace]
 # namespace 须与机器人侧桥配置的 namespace 完全一致（缺省 robot168）；桥未启用
 # namespace 时显式传空串：mit_control.py <ip>:<port> ""
+# 用法与缺省值也可以直接问示例：mit_control.py --help
 #
 # 本示例会下发模式切换与运动目标：没有确认提示，运行即动作，先确保机器人周围安全。
 # 句柄不显式关闭，进程退出时随进程回收；需要提前释放时可正常 close()/with（v1.0.1 起，
 # 此前版本的例外说明见 README）。
 
-import argparse
 import sys
 import time
 
+import example_common as common
 import shidou
 
 PERIOD_S = 0.01          # 100 Hz 下发
@@ -65,16 +66,16 @@ def parse_arm_layout(arm_info):
     return None
 
 
-def current_position(state, motor_id):
+def current_position(state, motor_id, verdicts):
     """从 get_state 快照中找电机当前位置；快照没有该电机时回退 0 并告警。"""
     for index, motor in enumerate(state.motor_ids):
         if motor == motor_id and index < len(state.positions):
             return state.positions[index]
-    print("[WARN] motor {} not in get_state snapshot, sweep from 0".format(motor_id))
+    verdicts.warn("motor {} not in get_state snapshot, sweep from 0".format(motor_id))
     return 0.0
 
 
-def sweep_motor(robot, motor_id, start):
+def sweep_motor(robot, verdicts, motor_id, start):
     """单电机三段直线插值扫动：start → 0.3 (1 s) → -0.3 (1 s) → 0 (1 s)。
 
     段内以实际经过时间为插值变量，睡眠抖动不累积；velocity 取段内斜率做速度前馈，
@@ -98,38 +99,26 @@ def sweep_motor(robot, motor_id, start):
                                   positions=[begin + (end - begin) * (elapsed / SEGMENT_SECONDS)],
                                   velocities=[slope],
                                   kps=[GAIN_KP], kds=[GAIN_KD]):
-                # send_* 的失败不写错误文本（见 README），这里只报结果。
-                print("[FAIL] publish motor {} failed".format(motor_id))
+                # send_* 失败返回 False（不抛异常）；失败后 last_error() 是本次调用的消息。
+                verdicts.fail("publish motor {} failed: {}".format(motor_id, robot.last_error()))
                 return False
             time.sleep(PERIOD_S)
         if not robot.send_mit(motor_ids=[motor_id], positions=[end], velocities=[0.0],
                               kps=[GAIN_KP], kds=[GAIN_KD]):
-            print("[FAIL] publish motor {} failed".format(motor_id))
+            verdicts.fail("publish motor {} failed: {}".format(motor_id, robot.last_error()))
             return False
     return True
 
 
-def main():
-    parser = argparse.ArgumentParser(description="对每臂末端电机做 MIT 位置扫动。")
-    parser.add_argument("address", nargs="?", default="192.168.168.168:7447",
-                        help="机器人侧 zenoh 桥的 <ip>:<port>（缺省 192.168.168.168:7447）")
-    parser.add_argument("namespace", nargs="?", default="robot168",
-                        help="keyexpr 前缀，须与桥配置一致；桥未启用前缀时传空串")
-    args = parser.parse_args()
-
-    shidou.init_logging("info")
-    robot = shidou.Robot(shidou.Config(robot_address=args.address, ns=args.namespace))
-    if not robot.ready:
-        print("[FAIL] {}".format(robot.last_error()))
-        return 1
-
+def sweep_joints(robot, cfg, verdicts):
+    """扫动流程：查状态 → 必要时 Enable → 解析臂布局 → 切 POSITION → 依次扫动 → 切回 ENABLED。"""
     # 先查状态：arm_info 决定扫动电机，fsm_state 决定是否需要先 Enable。
     try:
         state = robot.get_state()
     except shidou.ShidouError as error:
-        print("[FAIL] get_state: {}".format(error))
+        verdicts.fail("get_state: {}".format(error))
         shidou.shutdown()
-        return 1
+        return
     print("arm_info={}".format(state.arm_info))
     print("fsm_state={}".format(state.fsm_state))
 
@@ -139,16 +128,16 @@ def main():
         try:
             robot.enable()
         except shidou.ShidouError as error:
-            print("[FAIL] enable: {}".format(error))
+            verdicts.fail("enable: {}".format(error))
             shidou.shutdown()
-            return 1
+            return
         print("fsm_state={}".format(robot.fsm_state))
 
     layout = parse_arm_layout(state.arm_info)
     if layout is None:
-        print("[FAIL] arm_info={}: cannot parse layout/dof".format(state.arm_info))
+        verdicts.fail("arm_info={}: cannot parse layout/dof".format(state.arm_info))
         shidou.shutdown()
-        return 1
+        return
     has_left, has_right, left_dof, right_dof = layout
     layout_name = "dual" if has_left and has_right else ("left" if has_left else "right")
     print("arm layout: {} (left dof={}, right dof={})".format(layout_name, left_dof, right_dof))
@@ -164,26 +153,30 @@ def main():
     try:
         robot.set_mode(shidou.ControlMode.POSITION)
     except shidou.ShidouError as error:
-        print("[FAIL] set_mode(POSITION): {}".format(error))
+        verdicts.fail("set_mode(POSITION): {}".format(error))
         shidou.shutdown()
-        return 1
+        return
     print("fsm_state={}, sweeping {} motor(s)".format(robot.fsm_state, len(motors)))
 
     for motor_id in motors:
-        if not sweep_motor(robot, motor_id, current_position(state, motor_id)):
+        if not sweep_motor(robot, verdicts, motor_id, current_position(state, motor_id, verdicts)):
             shidou.shutdown()
-            return 1
+            return
 
     # 扫动结束切回 ENABLED，机器人回到可再次接收模式命令的状态。
     try:
         robot.enable()
     except shidou.ShidouError as error:
         shidou.shutdown()
-        print("[FAIL] enable: {}".format(error))
-        return 1
+        verdicts.fail("enable: {}".format(error))
+        return
     shidou.shutdown()
-    print("[PASS] Enable -> fsm_state={}".format(robot.fsm_state))
-    return 0
+    verdicts.pass_("Enable -> fsm_state={}".format(robot.fsm_state))
+
+
+def main():
+    # MIT 扫动没有自己的参数：位置参数只有 [<ip>:<port>] 与 [namespace]。
+    return common.run([], sweep_joints)
 
 
 if __name__ == "__main__":

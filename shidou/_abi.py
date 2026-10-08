@@ -6,8 +6,10 @@ The object is looked up next to these modules (a source-tree build staged by
 cmake) and then under _lib/<slug>/ (a prebuilt payload, see _library_path);
 SHIDOU_LIB overrides both.
 Keep the two in step: the ABI version check below catches a stale library,
-and every struct carries the struct_size the C side validates, so a layout
-change that was not mirrored fails loudly instead of reading garbage.
+the layout check at the end compares every field against the table the
+library exports, and every struct carries the struct_size the C side
+validates -- so a layout change that was not mirrored fails at import, by
+field name, instead of reading garbage.
 
 Comments and names follow the C side; see python/README.md for the Python
 API built on top of this module.
@@ -18,8 +20,9 @@ import os
 import platform
 import sys
 
-# Mirrors SHIDOU_PY_ABI_VERSION in python/src/shidou_py.cc.
-ABI_VERSION = 1
+# Mirrors SHIDOU_PY_ABI_VERSION in python/src/shidou_py.cc. 3: a failed
+# shidou_create leaves the reason in the handle's error text.
+ABI_VERSION = 3
 
 LIBRARY_NAME = "libshidou_py.so"
 
@@ -283,6 +286,19 @@ class ShidouFeedback(ctypes.Structure):
     ]
 
 
+class ShidouFieldDesc(ctypes.Structure):
+    """One row of the library's layout table (shidou_layout)."""
+
+    _fields_ = [
+        ("struct_name", ctypes.c_char_p),
+        ("field_name", ctypes.c_char_p),
+        ("offset", ctypes.c_size_t),
+        ("size", ctypes.c_size_t),
+        ("kind", ctypes.c_int),
+        ("elem", ctypes.c_char_p),
+    ]
+
+
 FEEDBACK_CALLBACK = ctypes.CFUNCTYPE(None, ctypes.POINTER(ShidouFeedback), ctypes.c_void_p)
 FSM_CALLBACK = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_void_p)
 STALE_CALLBACK = ctypes.CFUNCTYPE(None, ctypes.c_double, ctypes.c_void_p)
@@ -369,6 +385,164 @@ lib.shidou_set_stale_callback.restype = ctypes.c_int
 
 lib.shidou_last_error.argtypes = [HANDLE, ctypes.c_char_p, ctypes.c_size_t]
 lib.shidou_last_error.restype = ctypes.c_longlong
+
+
+# ---------------------------------------------------------------------------
+# Layout check.
+#
+# The ctypes structs above mirror python/src/shidou_py.cc by hand, and nothing
+# else compares the two: the struct_size guards catch only a mirror that became
+# smaller, while a reordered field or a same-size substitution (int32 for
+# uint32, a pointer for size_t) reads garbage with every guard green. The
+# library exports its own field table, built with offsetof/sizeof so it cannot
+# drift from the C definitions; the comparison below runs at import and names
+# every field the two descriptions disagree on.
+# ---------------------------------------------------------------------------
+
+KIND_U8 = 0
+KIND_U32 = 1
+KIND_I32 = 2
+KIND_U64 = 3
+KIND_F32 = 4
+KIND_F64 = 5
+KIND_STR = 6
+KIND_PTR = 7
+
+_KIND_NAMES = ("u8", "u32", "i32", "u64", "f32", "f64", "str", "ptr")
+
+# ctypes type -> kind. These numbers must match enum shidou_field_kind in
+# shidou_py.cc; a mismatch shows up here as a wrong kind, never as silence.
+# size_t and uint64_t are one kind because ctypes makes them the same class on
+# the platforms the binding ships for.
+_MIRROR_KINDS = {
+    ctypes.c_uint8: KIND_U8,
+    ctypes.c_uint32: KIND_U32,
+    ctypes.c_int32: KIND_I32,
+    ctypes.c_int: KIND_I32,
+    ctypes.c_size_t: KIND_U64,
+    ctypes.c_uint64: KIND_U64,
+    ctypes.c_float: KIND_F32,
+    ctypes.c_double: KIND_F64,
+    ctypes.c_char_p: KIND_STR,
+}
+
+# Pointee names as spelled by SHIDOU_PTR_FIELD in the table.
+_POINTEE_NAMES = {
+    ctypes.c_uint32: "uint32_t",
+    ctypes.c_uint8: "uint8_t",
+    ctypes.c_double: "double",
+    ctypes.c_float: "float",
+    ShidouMitWaypoint: "shidou_mit_waypoint_t",
+    ShidouCspWaypoint: "shidou_csp_waypoint_t",
+}
+
+_STRUCTS = (
+    ("shidou_config_t", ShidouConfig),
+    ("shidou_mit_target_t", ShidouMitTarget),
+    ("shidou_csp_target_t", ShidouCspTarget),
+    ("shidou_position_target_t", ShidouPositionTarget),
+    ("shidou_gripper_target_t", ShidouGripperTarget),
+    ("shidou_body_target_t", ShidouBodyTarget),
+    ("shidou_mit_waypoint_t", ShidouMitWaypoint),
+    ("shidou_csp_waypoint_t", ShidouCspWaypoint),
+    ("shidou_trajectory_t", ShidouTrajectory),
+    ("shidou_state_t", ShidouState),
+    ("shidou_feedback_t", ShidouFeedback),
+)
+
+
+def _mirror_description(field_type):
+    """(kind, elem) for one ctypes field type; kind is None when unknown.
+
+    POINTER(T) carries T in _type_, while the scalar types inherit _type_ as
+    the character code ctypes uses internally ('i', 'P', ...) -- only a class
+    there means a pointer.
+    """
+    pointee = getattr(field_type, "_type_", None)
+    if isinstance(pointee, type):
+        return KIND_PTR, _POINTEE_NAMES.get(pointee, "?")
+    return _MIRROR_KINDS.get(field_type), ""
+
+
+def _mirror_fields(struct_class):
+    """field name -> (offset, size, kind, elem) for one ctypes struct."""
+    fields = {}
+    for name, field_type in struct_class._fields_:
+        descriptor = getattr(struct_class, name)
+        kind, elem = _mirror_description(field_type)
+        fields[name] = (descriptor.offset, descriptor.size, kind, elem)
+    return fields
+
+
+def _format_description(description):
+    offset, size, kind, elem = description
+    kind_name = _KIND_NAMES[kind] if kind is not None and 0 <= kind < len(_KIND_NAMES) else "?"
+    return "offset {} size {} {}{}".format(offset, size, kind_name,
+                                           " " + elem if elem else "")
+
+
+def _library_fields():
+    """The library's layout table as struct name -> field name -> tuple."""
+    layout = lib.shidou_layout
+    layout.argtypes = [ctypes.POINTER(ctypes.POINTER(ShidouFieldDesc))]
+    layout.restype = ctypes.c_size_t
+    first = ctypes.POINTER(ShidouFieldDesc)()
+    count = layout(ctypes.byref(first))
+    fields = {}
+    for index in range(count):
+        row = first[index]
+        fields.setdefault(row.struct_name.decode(), {})[row.field_name.decode()] = (
+            row.offset, row.size, row.kind, row.elem.decode() if row.elem else "")
+    return fields
+
+
+def _check_layout():
+    """Compares the ctypes mirror against the library's table; raises on drift.
+
+    Runs at import: a mismatch means this package and this shared object do not
+    describe the same structs, and every call would read or write the wrong
+    bytes. Naming the fields turns that into a one-line fix.
+    """
+    try:
+        library = _library_fields()
+    except AttributeError:
+        raise ImportError(
+            "libshidou_py.so does not export shidou_layout: it is older than this "
+            "package and cannot describe its struct layouts; rebuild the binding "
+            "from the matching source tree") from None
+
+    problems = []
+    for struct_name, struct_class in _STRUCTS:
+        table = library.pop(struct_name, None)
+        if table is None:
+            problems.append("{}: in the mirror, missing from the library".format(struct_name))
+            continue
+        mirror = _mirror_fields(struct_class)
+        for field_name in sorted(set(table) | set(mirror)):
+            if field_name not in table:
+                problems.append("{}.{}: in the mirror, missing from the library".format(
+                    struct_name, field_name))
+            elif field_name not in mirror:
+                problems.append("{}.{}: in the library, missing from the mirror".format(
+                    struct_name, field_name))
+            elif table[field_name] != mirror[field_name]:
+                problems.append("{}.{}: the library has {}, the mirror has {}".format(
+                    struct_name, field_name, _format_description(table[field_name]),
+                    _format_description(mirror[field_name])))
+    for struct_name in sorted(library):
+        problems.append("{}: in the library, missing from the mirror".format(struct_name))
+
+    if problems:
+        shown = problems[:5]
+        remainder = len(problems) - len(shown)
+        raise ImportError(
+            "the ctypes mirror in python/shidou/_abi.py does not match the structs "
+            "in libshidou_py.so:\n  {}{}".format(
+                "\n  ".join(shown),
+                "\n  ... and {} more".format(remainder) if remainder else ""))
+
+
+_check_layout()
 
 
 # ---------------------------------------------------------------------------

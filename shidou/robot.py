@@ -9,15 +9,22 @@ Conventions:
 
 - Blocking handshakes (enable, stop, set_mode, set_namespace,
   upload_trajectory, get_state) either succeed or raise ShidouError carrying
-  the SDK's own message; the C++ SDK reports the same failures as `false`.
+  the SDK's own message for this call; the same failures come back from the
+  C++ SDK as a false-valued Result.
 - send_* are best-effort target streams: they return True when the frame was
   published and False otherwise, so a streaming loop does not pay for
   exceptions on every frame.
 - Callbacks run on zenoh session threads (feedback, fsm_state) or on the
   telemetry watchdog thread (stale): they must not block, and must not call
   the blocking methods above.
+- close() owns the handle lifetime: it waits for the calls already inside C,
+  then destroys the handle and releases the session that handle opened, and
+  anything called afterwards raises ShidouError. Callers never have to keep
+  close() away from other threads, callbacks excepted: a session release is
+  not allowed on a zenoh session thread.
 """
 
+import contextlib
 import ctypes
 import enum
 import threading
@@ -156,22 +163,40 @@ def init_logging(level):
 
 
 def shutdown():
-    """Closes the process-wide session; call once, after all robots closed."""
+    """Kept for callers written against older releases: a no-op now.
+
+    Every Robot owns the session it opened, so there is no process-wide
+    session left to close. The call stays safe at any point, including while
+    handles are open.
+    """
     lib.shidou_shutdown()
 
 
 class Robot:
     """A robot client.
 
-    Creating one initializes the process-wide zenoh session, so the first
-    Robot in a process fixes the session configuration; a later Robot with a
-    different configuration is not ready (check `ready`). Close every handle
-    before calling shidou.shutdown() at process end.
+    Creating one opens a zenoh session of its own, so several Robots can live
+    in one process, each with its own configuration, and closing a handle
+    releases the session it opened - not any other handle's. Closing is
+    synchronous and now includes that release, which closes the transport:
+    milliseconds for a local/peer session, seconds when the robot address
+    stopped answering. Call close() from a thread of your own, never from a
+    callback. The handle lifetime is owned by close(): it waits for the calls
+    already in flight, refuses the ones that follow, and may be called from
+    any thread that is not a zenoh session callback.
     """
 
     def __init__(self, config=None):
         self._handle = None
         self._callbacks = {}
+        # Handle-lifetime gate: every use of the handle goes through _lease(),
+        # and close() destroys it only once no lease is out. _active_calls
+        # counts the calls that are inside C right now; _closing is set for
+        # good by the first close(); _destroyed marks the end of destruction.
+        self._lifecycle = threading.Condition()
+        self._active_calls = 0
+        self._closing = False
+        self._destroyed = False
         # Out-structs borrow per-handle storage that the next call of the same
         # kind refills, so the call and the copy out of it must not interleave
         # with another thread doing the same. get_state and last_feedback use
@@ -193,32 +218,97 @@ class Robot:
 
     # -- lifecycle ---------------------------------------------------------
 
-    def _h(self):
-        if self._handle is None:
-            raise ShidouError("the robot handle is closed")
-        return self._handle
+    @contextlib.contextmanager
+    def _lease(self, or_none=False):
+        """Leases the handle for one operation on it.
+
+        Every C entry point that takes the handle goes through here. The lease
+        is what makes close() safe: the handle cannot be destroyed while one
+        is out, and a lease cannot start on a closed - or closing - handle; it
+        raises ShidouError instead, so callers keep seeing one error for "no
+        handle left". With or_none a closed handle leases as None, for the two
+        entry points that accept a null handle and fall back to process-wide
+        state (ready, last_error).
+        """
+        with self._lifecycle:
+            if self._closing or self._handle is None:
+                if not or_none:
+                    raise ShidouError("the robot handle is closed")
+                handle = None
+            else:
+                handle = self._handle
+            self._active_calls += 1
+        try:
+            yield handle
+        finally:
+            with self._lifecycle:
+                self._active_calls -= 1
+                if self._active_calls == 0:
+                    self._lifecycle.notify_all()
+
+    def _call(self, function, *args):
+        """One C entry point on this handle, under a lease."""
+        with self._lease() as handle:
+            return function(handle, *args)
 
     @property
     def ready(self):
-        """True when the comm objects were created; see last_error()."""
-        if self._handle is None:
-            return False
-        return lib.shidou_ready(self._handle) == 1
+        """True when the comm objects were created.
+
+        A failed creation leaves its reason in last_error() (the session's
+        own message when it could not be opened, the robot's otherwise) and
+        logs the same cause at error level.
+        """
+        with self._lease(or_none=True) as handle:
+            return handle is not None and lib.shidou_ready(handle) == 1
 
     def last_error(self):
-        """Last failure message; sticky, exactly as the C++ SDK reports it."""
-        return _read_string_call(lib.shidou_last_error, self._handle)
+        """Most recent failure message, whichever operation produced it.
+
+        Sticky, exactly as the C++ SDK reports it: a success never clears it,
+        so it is a diagnostic record, not the outcome of the last call. The
+        exception text of a failed blocking call is that call's own message.
+        A failed creation records why here as well, and a later failure
+        replaces that record like any other. A handle that was created ready
+        reports "" until something fails.
+        """
+        with self._lease(or_none=True) as handle:
+            return _read_string_call(lib.shidou_last_error, handle)
 
     def close(self):
-        """Destroys the handle. Idempotent; leaves the session open."""
-        if self._handle is not None:
+        """Destroys the handle once every call in flight has returned.
+
+        Idempotent; it also releases the session the handle opened, closing
+        the transport synchronously - fast for a local session, seconds when
+        the robot address stopped answering. A call that is already inside C
+        is waited for; a call that arrives after this point raises. Closers
+        that arrive concurrently all return only once the handle is gone.
+        Not from a callback: a session release is not allowed on a zenoh
+        session thread.
+        """
+        with self._lifecycle:
+            if self._closing:
+                # Another thread is closing or has closed it: wait, so that
+                # returning from close() means the handle is destroyed.
+                while not self._destroyed:
+                    self._lifecycle.wait()
+                return
+            self._closing = True
+            while self._active_calls:
+                self._lifecycle.wait()
             handle = self._handle
+            # No lease can start from here on, so the handle is unreachable
+            # and destroying it needs no lock.
             self._handle = None
+        if handle is not None:
             lib.shidou_destroy(handle)
-            # Retired, not dropped: an invocation that started before the
-            # destroy is not waited for (see _RETAINED).
-            _RETAINED.extend(self._callbacks.values())
-            self._callbacks.clear()
+        with self._lifecycle:
+            self._destroyed = True
+            self._lifecycle.notify_all()
+        # Retired, not dropped: an invocation that started before the destroy
+        # is not waited for (see _RETAINED).
+        _RETAINED.extend(self._callbacks.values())
+        self._callbacks.clear()
 
     def __enter__(self):
         return self
@@ -235,25 +325,25 @@ class Robot:
         Call only with no other operation on this robot in flight; the
         telemetry cache is cleared on success.
         """
-        rc = lib.shidou_set_namespace(self._h(), _encode(ns) or b"")
+        rc = self._call(lib.shidou_set_namespace, _encode(ns) or b"")
         if rc != 0:
             raise ShidouError(self.last_error())
 
     def enable(self, timeout_ms=-1):
         """Handshake to ENABLED; timeout_ms < 0 uses the SDK default (5 s)."""
-        rc = lib.shidou_enable(self._h(), timeout_ms)
+        rc = self._call(lib.shidou_enable, timeout_ms)
         if rc != 0:
             raise ShidouError(self.last_error())
 
     def stop(self, timeout_ms=-1):
         """Handshake to STOP; timeout_ms < 0 uses the SDK default (5 s)."""
-        rc = lib.shidou_stop(self._h(), timeout_ms)
+        rc = self._call(lib.shidou_stop, timeout_ms)
         if rc != 0:
             raise ShidouError(self.last_error())
 
     def set_mode(self, mode, timeout_ms=-1):
         """Switches the control mode; requires ENABLED on the robot side."""
-        rc = lib.shidou_set_mode(self._h(), int(mode), timeout_ms)
+        rc = self._call(lib.shidou_set_mode, int(mode), timeout_ms)
         if rc != 0:
             raise ShidouError(self.last_error())
 
@@ -309,7 +399,7 @@ class Robot:
             trajectory.csp_points_len = len(csp_points)
             alive.append(structs)
 
-        rc = lib.shidou_upload_trajectory(self._h(), ctypes.byref(trajectory), timeout_ms)
+        rc = self._call(lib.shidou_upload_trajectory, ctypes.byref(trajectory), timeout_ms)
         if rc != 0:
             raise ShidouError(self.last_error())
 
@@ -335,7 +425,7 @@ class Robot:
         target.kps = extra
         extra, target.kds_len = _abi.array(kds, ctypes.c_double)
         target.kds = extra
-        return lib.shidou_send_mit(self._h(), ctypes.byref(target)) == 0
+        return self._call(lib.shidou_send_mit, ctypes.byref(target)) == 0
 
     def send_csp(self, motor_ids, positions, velocities=None, torques=None):
         """Streams one CSP target; True when it was published."""
@@ -348,7 +438,7 @@ class Robot:
         target.velocities = extra
         extra, target.torques_len = _abi.array(torques, ctypes.c_double)
         target.torques = extra
-        return lib.shidou_send_csp(self._h(), ctypes.byref(target)) == 0
+        return self._call(lib.shidou_send_csp, ctypes.byref(target)) == 0
 
     def send_position(self, motor_ids, positions, velocities=None, torques=None,
                       accelerations=None):
@@ -364,7 +454,7 @@ class Robot:
         target.torques = extra
         extra, target.accelerations_len = _abi.array(accelerations, ctypes.c_double)
         target.accelerations = extra
-        return lib.shidou_send_position(self._h(), ctypes.byref(target)) == 0
+        return self._call(lib.shidou_send_position, ctypes.byref(target)) == 0
 
     def send_gripper(self, motor_ids, open, kps=None, kds=None):
         """Streams one gripper target (open is normalized [0, 1])."""
@@ -377,7 +467,7 @@ class Robot:
         target.kps = extra
         extra, target.kds_len = _abi.array(kds, ctypes.c_double)
         target.kds = extra
-        return lib.shidou_send_gripper(self._h(), ctypes.byref(target)) == 0
+        return self._call(lib.shidou_send_gripper, ctypes.byref(target)) == 0
 
     def send_body(self, wheel_ids=None, velocities=None, max_currents=None,
                   pushrod_id=0, position=0.0, velocity=0.0, acceleration=0.0):
@@ -399,7 +489,7 @@ class Robot:
         target.position = position
         target.velocity = velocity
         target.acceleration = acceleration
-        return lib.shidou_send_body(self._h(), ctypes.byref(target)) == 0
+        return self._call(lib.shidou_send_body, ctypes.byref(target)) == 0
 
     # -- telemetry ---------------------------------------------------------
 
@@ -410,8 +500,8 @@ class Robot:
         from several threads; a concurrent call waits for this one.
         """
         view = _abi.new(_abi.ShidouState)
-        with self._state_lock:
-            rc = lib.shidou_get_state(self._h(), ctypes.byref(view), timeout_ms)
+        with self._state_lock, self._lease() as handle:
+            rc = lib.shidou_get_state(handle, ctypes.byref(view), timeout_ms)
             if rc != 0:
                 raise ShidouError(self.last_error())
             return _state_from(view)
@@ -423,8 +513,8 @@ class Robot:
         one (it does not wait for get_state).
         """
         view = _abi.new(_abi.ShidouFeedback)
-        with self._feedback_lock:
-            rc = lib.shidou_last_feedback(self._h(), ctypes.byref(view))
+        with self._feedback_lock, self._lease() as handle:
+            rc = lib.shidou_last_feedback(handle, ctypes.byref(view))
             if rc < 0:
                 raise ShidouError(self.last_error())
             if rc == 0:
@@ -434,17 +524,18 @@ class Robot:
     @property
     def feedback_age_ms(self):
         """Milliseconds since the latest sample; -1.0 when none has arrived."""
-        return lib.shidou_feedback_age_ms(self._h())
+        return self._call(lib.shidou_feedback_age_ms)
 
     @property
     def feedback_seq(self):
         """Number of samples received since the last namespace switch."""
-        return lib.shidou_feedback_seq(self._h())
+        return self._call(lib.shidou_feedback_seq)
 
     @property
     def fsm_state(self):
         """Current fsm_state as published by the robot ("" before the first)."""
-        return _read_string_call(lib.shidou_fsm_state, self._h())
+        with self._lease() as handle:
+            return _read_string_call(lib.shidou_fsm_state, handle)
 
     # -- callbacks ---------------------------------------------------------
 
@@ -463,18 +554,24 @@ class Robot:
         cleared or replaced may still run once.
         """
         if callback is None:
-            lib.shidou_set_feedback_callback(self._h(), _abi.FEEDBACK_CALLBACK(), None)
-            self._retire("feedback")
+            with self._lease() as handle:
+                lib.shidou_set_feedback_callback(handle, _abi.FEEDBACK_CALLBACK(), None)
+                self._retire("feedback")
             return
 
         def bridge(view, user_data):
             callback(_feedback_from(view.contents))
 
         trampoline = _abi.FEEDBACK_CALLBACK(bridge)
-        if lib.shidou_set_feedback_callback(self._h(), trampoline, None) != 0:
+        with self._lease() as handle:
+            # Handing the trampoline over and recording it happen under one
+            # lease, so a close() cannot slip between the two and drop it.
+            rc = lib.shidou_set_feedback_callback(handle, trampoline, None)
+            if rc == 0:
+                self._retire("feedback")
+                self._callbacks["feedback"] = trampoline
+        if rc != 0:
             raise ShidouError(self.last_error())
-        self._retire("feedback")
-        self._callbacks["feedback"] = trampoline
 
     def set_fsm_callback(self, callback):
         """Registers callback(state) for fsm_state; None clears it.
@@ -482,18 +579,22 @@ class Robot:
         Runs on a zenoh session thread, same rules as set_feedback_callback.
         """
         if callback is None:
-            lib.shidou_set_fsm_callback(self._h(), _abi.FSM_CALLBACK(), None)
-            self._retire("fsm")
+            with self._lease() as handle:
+                lib.shidou_set_fsm_callback(handle, _abi.FSM_CALLBACK(), None)
+                self._retire("fsm")
             return
 
         def bridge(state, user_data):
             callback(state.decode("utf-8", "replace") if state else "")
 
         trampoline = _abi.FSM_CALLBACK(bridge)
-        if lib.shidou_set_fsm_callback(self._h(), trampoline, None) != 0:
+        with self._lease() as handle:
+            rc = lib.shidou_set_fsm_callback(handle, trampoline, None)
+            if rc == 0:
+                self._retire("fsm")
+                self._callbacks["fsm"] = trampoline
+        if rc != 0:
             raise ShidouError(self.last_error())
-        self._retire("fsm")
-        self._callbacks["fsm"] = trampoline
 
     def set_stale_callback(self, callback, threshold_ms=1000):
         """Registers callback(age_ms) for the staleness watchdog; None clears.
@@ -502,15 +603,19 @@ class Robot:
         threshold_ms, on the telemetry watchdog thread.
         """
         if callback is None:
-            lib.shidou_set_stale_callback(self._h(), 0, _abi.STALE_CALLBACK(), None)
-            self._retire("stale")
+            with self._lease() as handle:
+                lib.shidou_set_stale_callback(handle, 0, _abi.STALE_CALLBACK(), None)
+                self._retire("stale")
             return
 
         def bridge(age_ms, user_data):
             callback(age_ms)
 
         trampoline = _abi.STALE_CALLBACK(bridge)
-        if lib.shidou_set_stale_callback(self._h(), int(threshold_ms), trampoline, None) != 0:
+        with self._lease() as handle:
+            rc = lib.shidou_set_stale_callback(handle, int(threshold_ms), trampoline, None)
+            if rc == 0:
+                self._retire("stale")
+                self._callbacks["stale"] = trampoline
+        if rc != 0:
             raise ShidouError(self.last_error())
-        self._retire("stale")
-        self._callbacks["stale"] = trampoline

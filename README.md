@@ -5,9 +5,11 @@
 ## 目录结构
 
 ```
-shidou/                    # Python 包；_lib/<platform>/ 下是随包发布的 .so
-  _lib/linux/              # x86_64（Ubuntu 22.04，glibc 2.35）
-  _lib/linux-arm64/        # aarch64（同上）
+shidou/                    # Python 包；_lib/<platform>/ 下是随包的预编译库
+  _lib/linux/              # x86_64（Ubuntu 22.04，glibc 2.35）：libshidou_py.so + libzenohc.so
+  _lib/linux-arm64/        # aarch64（同上）：同上
+  _lib/win/                # Windows x64：shidou_py.dll + zenohc.dll
+  _lib/win-arm64/          # Windows ARM64：同上
 examples/                  # 控制示例（get_state / get_joint / set_fsm /
                            # mit_control / pushrod_control / chassis_control）
 pyproject.toml             # 打包元数据（pip 用）
@@ -22,6 +24,11 @@ git clone https://github.com/ZZSZSZSZZ/shidou_sdk_python.git
 cd shidou_sdk_python
 pip3 install -e .
 ```
+
+Windows（x86_64）上是同一条路，只是 `python3` / `pip3` 换成 `python` / `pip`（下同）：
+用 `python -m pip install -e .`、`python examples/get_state.py …`。`shidou/_lib/win/`
+会被自动选中，装载层把 DLL 搜索路径指向库所在目录（对应 Linux 的 `$ORIGIN`），
+import 不需要设置任何环境变量。
 
 也可以装进 site-packages（每次更新后要重装），或者完全不装：
 
@@ -38,6 +45,8 @@ PYTHONPATH=/path/to/shidou_sdk_python python3 examples/get_state.py
 pip 24.2 可用（实测）。两种失败方式都不指向真正原因：可编辑安装报 `build backend is
 missing the 'build_editable' hook`；非可编辑安装更隐蔽——**成功退出**，但装出来的是
 没有元数据的 `UNKNOWN 0.0.0`，`import shidou` 依然失败。先 `pip3 install -U pip` 再安装。
+Windows 上同理先 `python -m pip install -U pip`（新安装包自带的 pip 已够新，实测 Python
+3.13 自带的 pip 25.0.1 直接可编辑安装通过）。
 
 ## 运行示例
 
@@ -119,9 +128,10 @@ robot.set_stale_callback(lambda age_ms: print("stale", age_ms), threshold_ms=100
 
 ## 注意事项
 
-- 预编译库由 GitHub Actions 流水线构建（Ubuntu 22.04，glibc ≥ 2.35）：`shidou/_lib/` 下的 `linux` 与
-  `linux-arm64` 一架构一目录、不可混用；本机架构没有对应库、或包不完整时，import
-  会给出明确的 `ImportError`（`SHIDOU_LIB` 可指定别处的 `.so`）
+- 预编译库由 GitHub Actions 流水线构建：Linux 两条（Ubuntu 22.04，glibc ≥ 2.35）、
+  Windows x64（windows-latest，VS2022 工具集）——`shidou/_lib/` 一架构一目录、不可混用；
+  本机架构没有对应库、或包不完整时，import 会给出明确的 `ImportError`（`SHIDOU_LIB`
+  可指定别处的库文件：Linux 的 `.so` 或 Windows 的 `shidou_py.dll`）
 - **句柄生命周期**：每个 `Robot` 在创建时打开自己的会话（配置各自生效，同进程可以并存
   多个句柄），`close()`（含 `with` 退出）在销毁句柄时释放它，只影响自己那一份；不调
   `close()` 则进程退出时随之释放（仓库里的示例都不显式 `close()`）。`close()` 会同步
@@ -149,5 +159,6 @@ robot.set_stale_callback(lambda age_ms: print("stale", age_ms), threshold_ms=100
 
 本仓库以 BSD-3-Clause 发布（见 LICENSE）。第三方依赖许可见 [licenses/](licenses/)：
 zenoh-c / zenoh-cpp 为 Apache-2.0 或 EPL-2.0 双许可，spdlog 为 MIT——三者的代码都静态
-进了 `libshidou_py.so`。协议与字段定义、`robot_ops` 板端工具见 C++ SDK：
+进了绑定库（Linux 为 `libshidou_py.so`，Windows 为 `shidou_py.dll`）。协议与字段定义、
+`robot_ops` 板端工具见 C++ SDK：
 <https://github.com/ZZSZSZSZZ/shidou_sdk>。

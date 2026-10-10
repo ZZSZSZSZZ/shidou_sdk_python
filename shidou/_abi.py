@@ -1,10 +1,11 @@
-"""ctypes declarations for libshidou_py.so.
+"""ctypes declarations for the shidou_py shared library.
 
 The C ABI lives in python/src/shidou_py.cc; this module mirrors its struct
-layouts and entry-point signatures one for one, and loads the shared object.
-The object is looked up next to these modules (a source-tree build staged by
-cmake) and then under _lib/<slug>/ (a prebuilt payload, see _library_path);
-SHIDOU_LIB overrides both.
+layouts and entry-point signatures one for one, and loads the shared library
+(libshidou_py.so on ELF, shidou_py.dll on Windows). The object is looked up
+next to these modules (a source-tree build staged by cmake) and then under
+_lib/<slug>/ (a prebuilt payload, see _library_path); SHIDOU_LIB overrides
+both.
 Keep the two in step: the ABI version check below catches a stale library,
 the layout check at the end compares every field against the table the
 library exports, and every struct carries the struct_size the C side
@@ -24,17 +25,23 @@ import sys
 # shidou_create leaves the reason in the handle's error text.
 ABI_VERSION = 3
 
-LIBRARY_NAME = "libshidou_py.so"
+# The name the build stages next to these modules: MSVC keeps its default
+# output name for a shared library (no lib prefix), the same convention as the
+# zenohc.dll it links; the ELF build stages libshidou_py.so.
+LIBRARY_NAME = "shidou_py.dll" if sys.platform == "win32" else "libshidou_py.so"
 
-# Prebuilt payload layout: shidou/_lib/<slug>/ holds the shared object next to
-# the libzenohc.so it links (the object carries RUNPATH=$ORIGIN). The slugs are
-# the ones ci/build_dist_python.py writes and match the C++ payload's
-# lib/<platform>/ names.
+# Prebuilt payload layout: shidou/_lib/<slug>/ holds the shared library next to
+# the runtime it links (libzenohc.so resolved through RUNPATH=$ORIGIN on ELF;
+# zenohc.dll resolved through the library directory added to the DLL search
+# path on Windows). The slugs are the ones ci/build_dist_python.py writes and
+# match the C++ payload's lib/<platform>/ names.
 PAYLOAD_SLUGS = {
     ("linux", "x86_64"): "linux",
     ("linux", "amd64"): "linux",
     ("linux", "aarch64"): "linux-arm64",
     ("linux", "arm64"): "linux-arm64",
+    ("win32", "amd64"): "win",
+    ("win32", "arm64"): "win-arm64",
 }
 
 
@@ -74,6 +81,25 @@ def _shipped_payloads():
         return []
 
 
+# os.add_dll_directory handles stay referenced for the process lifetime:
+# closing one (or letting it be collected) removes the directory again, and the
+# loaded binding resolves its dependencies from it for as long as it is loaded.
+_DLL_DIRECTORIES = []
+
+
+def _add_dll_search_directory(path):
+    """Windows: let the loader find the library's dependencies beside it.
+
+    The counterpart of the ELF $ORIGIN RUNPATH the installed object carries:
+    the Windows loader does not search the directory of the library being
+    loaded, so zenohc.dll sitting next to the binding is resolved only after
+    that directory is added to the DLL search path.
+    """
+    if sys.platform == "win32":
+        _DLL_DIRECTORIES.append(
+            os.add_dll_directory(os.path.dirname(os.path.abspath(path))))
+
+
 def _load_library():
     path = _library_path()
     if not os.path.exists(path):
@@ -87,8 +113,25 @@ def _load_library():
             "{} not found at {}: build it with "
             "cmake -DSHIDOU_BUILD_PYTHON=ON -S <source tree> -B <build dir>, then run "
             "python with PYTHONPATH=<build dir>/python (or point SHIDOU_LIB at the "
-            "shared object).{}".format(LIBRARY_NAME, path, detail))
-    return ctypes.CDLL(path)
+            "shared library).{}".format(LIBRARY_NAME, path, detail))
+    _add_dll_search_directory(path)
+    try:
+        return ctypes.CDLL(path)
+    except OSError as error:
+        # The Windows loader names no module when a dependency is missing
+        # ("The specified module could not be found"), which reads as if the
+        # binding itself were absent; translate it into the diagnostic the
+        # other error paths give. ELF names the dependency in its own message,
+        # so there the system error is raised unchanged.
+        if sys.platform != "win32":
+            raise
+        raise ImportError(
+            "{} was found at {} but could not be loaded: {}. It links the runtime "
+            "the build stages beside it (libzenohc.so on Linux, zenohc.dll on "
+            "Windows); this machine reports {}/{}. Point SHIDOU_LIB at the staged "
+            "copy in the build tree, or place that runtime library next to the one "
+            "you point at.".format(
+                LIBRARY_NAME, path, error, sys.platform, platform.machine())) from None
 
 
 lib = _load_library()
@@ -96,8 +139,9 @@ lib = _load_library()
 _version = lib.shidou_abi_version()
 if _version != ABI_VERSION:
     raise ImportError(
-        "libshidou_py.so reports ABI version {} but this package expects {}: rebuild the "
-        "binding from the matching source tree".format(_version, ABI_VERSION))
+        "{} reports ABI version {} but this package expects {}: rebuild the "
+        "binding from the matching source tree".format(
+            LIBRARY_NAME, _version, ABI_VERSION))
 
 
 # ---------------------------------------------------------------------------
@@ -507,9 +551,9 @@ def _check_layout():
         library = _library_fields()
     except AttributeError:
         raise ImportError(
-            "libshidou_py.so does not export shidou_layout: it is older than this "
-            "package and cannot describe its struct layouts; rebuild the binding "
-            "from the matching source tree") from None
+            "{} does not export shidou_layout: it is older than this package and "
+            "cannot describe its struct layouts; rebuild the binding from the "
+            "matching source tree".format(LIBRARY_NAME)) from None
 
     problems = []
     for struct_name, struct_class in _STRUCTS:
@@ -537,7 +581,8 @@ def _check_layout():
         remainder = len(problems) - len(shown)
         raise ImportError(
             "the ctypes mirror in python/shidou/_abi.py does not match the structs "
-            "in libshidou_py.so:\n  {}{}".format(
+            "in {}:\n  {}{}".format(
+                LIBRARY_NAME,
                 "\n  ".join(shown),
                 "\n  ... and {} more".format(remainder) if remainder else ""))
 

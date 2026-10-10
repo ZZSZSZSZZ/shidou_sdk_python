@@ -1,5 +1,5 @@
-# The prebuilt shared objects under shidou/_lib/ are the payload and are
-# committed: *.so is deliberately NOT ignored here.
+# The prebuilt shared objects and DLLs under shidou/_lib/ are the payload
+# and are committed: *.so and *.dll are deliberately NOT ignored here.
 build/
 dist/
 *.egg-info/

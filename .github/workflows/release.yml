@@ -1,9 +1,10 @@
 name: release
 
-# Tag releases: validate the committed prebuilt payload on both
-# architectures (each leg on the architecture it ships, so the aarch64
-# object is really loaded) by calling ci.yml, then attach archives of the
-# tagged tree to the GitHub Release of the pushed tag.
+# Tag releases: validate the committed prebuilt payload on every platform it
+# ships for (each leg on the architecture and OS it ships, so the aarch64
+# object and the Windows DLLs are really loaded; the leg matrix lives in
+# ci.yml) by calling ci.yml, then attach archives of the tagged tree to the
+# GitHub Release of the pushed tag.
 
 on:
   push:
@@ -33,8 +34,8 @@ jobs:
 
   validate:
     # ci.yml's import / install / wheel definition, reused so the tag-time
-    # check cannot drift from the push-time one; the matrix legs, their
-    # runner and the timeout live there.
+    # check cannot drift from the push-time one; the matrix legs (Linux and
+    # Windows), their runners and the timeout live there.
     needs: tag-check
     uses: ./.github/workflows/ci.yml
 

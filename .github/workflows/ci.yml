@@ -3,7 +3,7 @@ name: ci
 # Validates the committed prebuilt payload on every platform it ships for.
 # Each leg runs on the architecture and OS it ships, so the aarch64 objects
 # are loaded and exercised for real here (a development x86_64 host cannot
-# do that) and the Windows leg loads the committed DLLs on Windows. A
+# do that) and the Windows legs load the committed DLLs on Windows. A
 # platform whose payload is not committed yet has no leg; its leg arrives
 # with its payload. release.yml reuses this definition on tags
 # (workflow_call), so the push-time and tag-time checks cannot drift.
@@ -28,6 +28,7 @@ jobs:
           - { os: ubuntu-22.04, platform: linux, python: python3, venv: .venv/bin }
           - { os: ubuntu-22.04-arm, platform: linux-arm64, python: python3, venv: .venv/bin }
           - { os: windows-latest, platform: win, python: python, venv: .venv/Scripts }
+          - { os: windows-11-arm, platform: win-arm64, python: python, venv: .venv/Scripts }
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:
@@ -38,10 +39,18 @@ jobs:
         run: |
           set -eu
           machine=$(uname -m)
+          # Git Bash on Windows reports the machine in the MSYS spelling,
+          # which may be arm64 rather than aarch64 on Windows ARM64; both
+          # name the one architecture the leg ships objects for.
+          case "$machine" in
+            arm64|ARM64) machine=aarch64 ;;
+            AMD64) machine=x86_64 ;;
+          esac
           case "${{ matrix.platform }}" in
             linux) expected=x86_64 ;;
             linux-arm64) expected=aarch64 ;;
             win) expected=x86_64 ;;
+            win-arm64) expected=aarch64 ;;
           esac
           if [ "$machine" != "$expected" ]; then
             echo "runner is $machine, this leg ships $expected"
@@ -72,18 +81,21 @@ jobs:
           # so what is asserted here is that the two files ship side by side
           # for that directory to exist, and that the committed binding is
           # the architecture this leg's runner can load -- the field the
-          # assembler guards on.
-          ${{ matrix.python }} - "$libdir" <<'PY'
+          # assembler guards on (AMD64 0x8664 / ARM64 0xAA64).
+          ${{ matrix.python }} - "$libdir" "${{ matrix.platform }}" <<'PY'
           import struct
           import sys
 
+          expected = {"win": 0x8664, "win-arm64": 0xAA64}[sys.argv[2]]
+          names = {0x8664: "AMD64", 0xAA64: "ARM64"}
           data = open(sys.argv[1] + "/shidou_py.dll", "rb").read()
           pe_offset = struct.unpack_from("<I", data, 0x3C)[0]
           assert data[:2] == b"MZ" and data[pe_offset:pe_offset + 4] == b"PE\0\0", \
               "shidou_py.dll is not a PE image"
           machine = struct.unpack_from("<H", data, pe_offset + 4)[0]
-          assert machine == 0x8664, "shidou_py.dll is not AMD64 (0x%04x)" % machine
-          print("shidou_py.dll is AMD64 (0x8664)")
+          assert machine == expected, \
+              "shidou_py.dll is not %s (0x%04x)" % (names[expected], machine)
+          print("shidou_py.dll is %s (0x%04x)" % (names[expected], expected))
           PY
 
       - name: Peer-mode check without pip
@@ -174,14 +186,13 @@ jobs:
             ${{ matrix.python }} "examples/$name.py" --help > /dev/null
           done
 
-      - name: Wheel carries every payload the tree ships
+      - name: Wheel carries the four payload directories
         shell: bash
         run: |
           set -eu
           "${{ matrix.venv }}/python" -m pip wheel --quiet --no-deps --wheel-dir dist .
           "${{ matrix.venv }}/python" - <<'PY'
           import glob
-          import os
           import zipfile
 
           names = zipfile.ZipFile(glob.glob("dist/*.whl")[0]).namelist()
@@ -191,15 +202,13 @@ jobs:
               "win": ("shidou_py.dll", "zenohc.dll"),
               "win-arm64": ("shidou_py.dll", "zenohc.dll"),
           }
-          # The four slugs are the payload universe; a tree assembled before
-          # a platform's payload exists ships only the directories it has,
-          # and the wheel must carry each of those in full.
-          shipped = [slug for slug in ("linux", "linux-arm64", "win", "win-arm64")
-                     if os.path.isdir(os.path.join("shidou", "_lib", slug))]
-          assert shipped, "the tree ships no payload directory"
-          for slug in shipped:
+          # Every release tree ships all four payload directories, so the
+          # wheel must carry each of them in full: a directory that went
+          # missing fails here by name instead of shipping a package whose
+          # payload resolves on only some of the platforms it claims.
+          for slug in ("linux", "linux-arm64", "win", "win-arm64"):
               for name in objects[slug]:
                   member = "shidou/_lib/{}/{}".format(slug, name)
                   assert member in names, "missing " + member
-          print("wheel carries every payload the tree ships: " + ", ".join(shipped))
+          print("wheel carries all four payload directories")
           PY

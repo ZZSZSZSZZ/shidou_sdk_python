@@ -25,10 +25,16 @@ cd shidou_sdk_python
 pip3 install -e .
 ```
 
-Windows（x86_64）上是同一条路，只是 `python3` / `pip3` 换成 `python` / `pip`（下同）：
-用 `python -m pip install -e .`、`python examples/get_state.py …`。`shidou/_lib/win/`
+Windows 上是同一条路（x86_64 与 ARM64 都一样），只是 `python3` / `pip3` 换成
+`python` / `pip`（下同）：用 `python -m pip install -e .`、
+`python examples/get_state.py …`。`shidou/_lib/win/` 或 `shidou/_lib/win-arm64/`
 会被自动选中，装载层把 DLL 搜索路径指向库所在目录（对应 Linux 的 `$ORIGIN`），
 import 不需要设置任何环境变量。
+
+**Windows ARM64 需要 CPython ≥ 3.11**：官方 Windows ARM64 安装包自 3.11 起提供，
+更早的 CPython 没有官方 arm64 安装包，3.10 及更早的 ARM64 Windows 无法使用本载荷。
+`pyproject.toml` 的 `requires-python = ">=3.8"` 保持不变（该下限对 Linux 与
+Windows x64 成立），win-arm64 的 ≥ 3.11 是这个平台的准入条件。
 
 也可以装进 site-packages（每次更新后要重装），或者完全不装：
 
@@ -128,8 +134,10 @@ robot.set_stale_callback(lambda age_ms: print("stale", age_ms), threshold_ms=100
 
 ## 注意事项
 
-- 预编译库由 GitHub Actions 流水线构建：Linux 两条（Ubuntu 22.04，glibc ≥ 2.35）、
-  Windows x64（windows-latest，VS2022 工具集）——`shidou/_lib/` 一架构一目录、不可混用；
+- 预编译库由 GitHub Actions 流水线构建：Linux 两条（Ubuntu 22.04，glibc ≥ 2.35）；
+  Windows 两条，工具集基线不同——x64 在 windows-latest 用 VS2022（v143）构建，
+  ARM64 在 windows-11-arm 原生构建，该镜像只有 VS2026 / MSVC 14.51（无 VS2022
+  可用），基线无法与 x64 对齐，如实分列——`shidou/_lib/` 一架构一目录、不可混用；
   本机架构没有对应库、或包不完整时，import 会给出明确的 `ImportError`（`SHIDOU_LIB`
   可指定别处的库文件：Linux 的 `.so` 或 Windows 的 `shidou_py.dll`）
 - **句柄生命周期**：每个 `Robot` 在创建时打开自己的会话（配置各自生效，同进程可以并存

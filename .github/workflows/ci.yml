@@ -34,24 +34,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Assert runner architecture
+      - name: Assert the interpreter is the architecture this leg ships
         shell: bash
         run: |
           set -eu
-          # Git Bash on Windows is an emulated x86_64 MSYS binary on
-          # Windows ARM64, so its uname reports the process architecture
-          # rather than the machine's; the Windows environment variable
-          # carries the machine architecture for processes of both kinds.
-          # On Linux uname reports the machine directly.
-          case "$(uname -s)" in
-            MINGW*|MSYS*|CYGWIN*) machine=$PROCESSOR_ARCHITECTURE ;;
-            *) machine=$(uname -m) ;;
-          esac
-          # The spellings the two sources use, normalized to the
-          # architecture names above.
+          # The leg's claim is that the object it ships is loaded here, so the
+          # architecture to check is the one of the process that loads it --
+          # the interpreter's -- and a shell probe cannot report that: on
+          # Windows ARM64, Git Bash is an emulated x86_64 MSYS binary whose
+          # uname and PROCESSOR_ARCHITECTURE both describe the emulated
+          # process rather than the host. This is also the value _abi.py
+          # resolves _lib/<slug>/ with, so a leg that passes here imports the
+          # payload directory it ships, not the one for the emulated host.
+          machine=$(${{ matrix.python }} -c 'import platform; print(platform.machine())' \
+            | tr -d '\r')
+          # The spellings the interpreter reports on each system, normalized
+          # to the architecture names above.
           case "$machine" in
-            arm64|ARM64) machine=aarch64 ;;
-            AMD64|x86_64) machine=x86_64 ;;
+            arm64|ARM64|aarch64) machine=aarch64 ;;
+            amd64|AMD64|x86_64) machine=x86_64 ;;
           esac
           case "${{ matrix.platform }}" in
             linux) expected=x86_64 ;;
@@ -59,10 +60,14 @@ jobs:
             win) expected=x86_64 ;;
             win-arm64) expected=aarch64 ;;
           esac
+          # RUNNER_ARCH is the platform's own record of the machine the leg
+          # was scheduled on; printed alongside so that a disagreement
+          # between the two is visible in the log.
           if [ "$machine" != "$expected" ]; then
-            echo "runner is $machine, this leg ships $expected"
+            echo "interpreter is $machine (RUNNER_ARCH $RUNNER_ARCH), this leg ships $expected"
             exit 1
           fi
+          echo "interpreter is $machine (RUNNER_ARCH $RUNNER_ARCH)"
 
       - name: Assert the payload resolves beside itself (ELF)
         if: runner.os == 'Linux'

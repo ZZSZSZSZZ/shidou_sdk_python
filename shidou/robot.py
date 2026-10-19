@@ -138,6 +138,8 @@ def _state_from(view):
     state.control_cycle_avg_ms = view.control_cycle_avg_ms
     state.control_cycle_max_ms = view.control_cycle_max_ms
     state.cycle_overruns = view.cycle_overruns
+    state.model = _abi.read_string(view.model)
+    state.body_info = _abi.read_string(view.body_info)
     state.has_feedback = view.has_feedback == 1
     state.feedback_seq = view.feedback_seq
     state.feedback_age_ms = view.feedback_age_ms

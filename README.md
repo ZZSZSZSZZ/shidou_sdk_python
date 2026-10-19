@@ -167,6 +167,5 @@ robot.set_stale_callback(lambda age_ms: print("stale", age_ms), threshold_ms=100
 
 本仓库以 BSD-3-Clause 发布（见 LICENSE）。第三方依赖许可见 [licenses/](licenses/)：
 zenoh-c / zenoh-cpp 为 Apache-2.0 或 EPL-2.0 双许可，spdlog 为 MIT——三者的代码都静态
-进了绑定库（Linux 为 `libshidou_py.so`，Windows 为 `shidou_py.dll`）。协议与字段定义、
-`robot_ops` 板端工具见 C++ SDK：
-<https://github.com/ZZSZSZSZZ/shidou_sdk>。
+进了绑定库（Linux 为 `libshidou_py.so`，Windows 为 `shidou_py.dll`）。线协议与字段定义
+见 C++ SDK 的 `include/shidou/msg/`：<https://github.com/ZZSZSZSZZ/shidou_sdk>。

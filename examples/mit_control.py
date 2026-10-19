@@ -45,10 +45,10 @@ def parse_dof(text):
 
 
 def parse_arm_layout(arm_info):
-    """解析 arm_info（"型号_布局_自由度"，布局段为 left / right / dual）。
+    """解析 arm_info（"{构型}_{自由度}"，构型段为 left / right / dual）。
 
-    返回 (has_left, has_right, left_dof, right_dof)；没有可识别的布局段或自由度
-    段非法时返回 None。非布局段（如型号段）跳过，不解析其后的段。
+    返回 (has_left, has_right, left_dof, right_dof)；没有可识别的构型段或自由度
+    段非法时返回 None。非构型段跳过，不解析其后的段。
     """
     segments = arm_info.split("_")
     for index in range(len(segments) - 1):

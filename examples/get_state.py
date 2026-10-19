@@ -27,6 +27,10 @@ def query_state(robot, cfg, verdicts):
     print("fsm_state      : {}".format(state.fsm_state))
     print("arm_info       : {}".format(state.arm_info))
     print("gripper_info   : {}".format(state.gripper_info))
+    # 型号名：手写配置通道下为空串。
+    print("model          : {}".format(state.model))
+    # 机身构型：none / wheels / pushrod / wheels_pushrod 的组合。
+    print("body_info      : {}".format(state.body_info))
     print("library_status : 0x{:04x}".format(state.library_status))
     print("control_freq_hz: {:.1f}".format(state.control_freq_hz))
     print("cycle avg/max  : {:.2f} / {:.2f} ms".format(state.control_cycle_avg_ms,

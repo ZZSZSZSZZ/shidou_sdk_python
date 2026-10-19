@@ -22,8 +22,10 @@ import platform
 import sys
 
 # Mirrors SHIDOU_PY_ABI_VERSION in python/src/shidou_py.cc. 3: a failed
-# shidou_create leaves the reason in the handle's error text.
-ABI_VERSION = 3
+# shidou_create leaves the reason in the handle's error text. 4: ShidouState
+# carries the model name the get_state reply may append after its statistics.
+# 5: and the body classes it may append after that.
+ABI_VERSION = 5
 
 # The name the build stages next to these modules: MSVC keeps its default
 # output name for a shared library (no lib prefix), the same convention as the
@@ -302,6 +304,8 @@ class ShidouState(ctypes.Structure):
         ("control_cycle_avg_ms", ctypes.c_double),
         ("control_cycle_max_ms", ctypes.c_double),
         ("cycle_overruns", ctypes.c_uint32),
+        ("model", ctypes.c_char_p),
+        ("body_info", ctypes.c_char_p),
         ("has_feedback", ctypes.c_int),
         ("feedback_seq", ctypes.c_uint64),
         ("feedback_age_ms", ctypes.c_double),

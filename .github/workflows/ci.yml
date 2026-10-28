@@ -138,7 +138,7 @@ jobs:
           # namespace of its own comes up ready and publishes there, and
           # closing it leaves the first handle working.
           second = shidou.Robot(shidou.Config(robot_address="", mode="peer",
-                                              enable_scouting=False, ns="second"))
+                                              enable_scouting=False, namespace="second"))
           assert second.ready, "a second handle's session did not come up"
           assert second.send_mit(motor_ids=[1], positions=[0.0]), \
               "the second handle's session did not publish"
@@ -190,12 +190,10 @@ jobs:
 
       - name: Examples parse
         shell: bash
-        env:
-          PYTHONPATH: ${{ github.workspace }}
         run: |
           set -eu
-          for name in get_state get_joint set_fsm mit_control pushrod_control chassis_control; do
-            ${{ matrix.python }} "examples/$name.py" --help > /dev/null
+          for name in get_state get_joint set_fsm mit_control pp_control pushrod_control chassis_control; do
+            ${{ matrix.python }} -m py_compile "examples/$name.py"
           done
 
       - name: Wheel carries the four payload directories

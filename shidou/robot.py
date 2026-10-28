@@ -7,10 +7,10 @@ for as long as the C side may call them.
 
 Conventions:
 
-- Blocking handshakes (enable, stop, set_mode, set_namespace,
-  upload_trajectory, get_state) either succeed or raise ShidouError carrying
-  the SDK's own message for this call; the same failures come back from the
-  C++ SDK as a false-valued Result.
+- Blocking handshakes (enable, stop, set_mode, set_namespace, get_state)
+  either succeed or raise ShidouError carrying the SDK's own message for this
+  call; the same failures come back from the C++ SDK as a false-valued
+  Result.
 - send_* are best-effort target streams: they return True when the frame was
   published and False otherwise, so a streaming loop does not pay for
   exceptions on every frame.
@@ -45,33 +45,48 @@ class ShidouError(RuntimeError):
 
 
 class ControlMode(enum.IntEnum):
-    """Modes selectable after the ENABLED handshake."""
+    """Control modes, each with an FSM state of the same name.
 
-    CSP = 0
-    POSITION = 1
-    TRAJECTORY = 2
+    A mode is entered with set_mode() from ENABLED or another mode state;
+    STOP leaves only through enable(). enable(mode) is the enable edge with a
+    mode token attached - the robot does not read that field, so it lands in
+    ENABLED as well. Every state accepts only its own mode's targets: MIT
+    targets in MIT, CSP targets in CSP, position targets in PP. Sending a
+    target never switches the mode.
+    """
+
+    MIT = 0
+    CSP = 1
+    PP = 2
 
 
 class Config:
     """Session configuration.
 
     None leaves the SDK default in place (robot_address 192.168.168.168:7447,
-    mode "client", scouting off, no namespace prefix, log level "info"). The
+    mode "client", scouting off, namespace "robot168", log level "info"). The
     namespace must match the robot-side bridge configuration exactly; an
     empty string means "no prefix", which is different from the default.
     """
 
     def __init__(self, robot_address=None, mode=None, enable_scouting=False,
-                 ns=None, log_level=None):
+                 namespace=None, log_level=None):
         self.robot_address = robot_address
         self.mode = mode
         self.enable_scouting = enable_scouting
-        self.ns = ns
+        self.namespace = namespace
         self.log_level = log_level
 
 
 class RobotState:
-    """Snapshot from Robot.get_state(): the service response plus telemetry."""
+    """Snapshot from Robot.get_state(): the service response plus telemetry.
+
+    The per-motor arrays (motor_ids, positions, velocities, torques,
+    control_mode, control_mode_confidence) are index-aligned with each other.
+    control_mode_confidence is confirmed / requested / unknown; only confirmed
+    means the device accepted the mode. Both mode arrays are empty against a
+    robot that does not report them.
+    """
 
     def __repr__(self):
         return ("RobotState(fsm_state={!r}, motor_ids={!r}, positions={!r}, "
@@ -87,26 +102,6 @@ class JointFeedback:
         return ("JointFeedback(motor_ids={!r}, position={!r}, enabled={!r}, "
                 "online={!r})").format(self.motor_ids, self.position,
                                        self.enabled, self.online)
-
-
-class MITWaypoint:
-    """Trajectory waypoint for MIT drives; omitted arrays mean zero."""
-
-    def __init__(self, positions, velocities=None, torques=None, stop_point=False):
-        self.positions = list(positions)
-        self.velocities = list(velocities) if velocities else []
-        self.torques = list(torques) if torques else []
-        self.stop_point = bool(stop_point)
-
-
-class CSPWaypoint:
-    """Trajectory waypoint for CSP drives (Ruckig limits per joint)."""
-
-    def __init__(self, positions, max_velocity=None, max_acceleration=None, torques=None):
-        self.positions = list(positions)
-        self.max_velocity = list(max_velocity) if max_velocity else []
-        self.max_acceleration = list(max_acceleration) if max_acceleration else []
-        self.torques = list(torques) if torques else []
 
 
 def _encode(text):
@@ -143,6 +138,9 @@ def _state_from(view):
     state.has_feedback = view.has_feedback == 1
     state.feedback_seq = view.feedback_seq
     state.feedback_age_ms = view.feedback_age_ms
+    state.control_mode = _abi.read_string_array(view.control_mode, view.control_mode_len)
+    state.control_mode_confidence = _abi.read_string_array(
+        view.control_mode_confidence, view.control_mode_confidence_len)
     return state
 
 
@@ -211,7 +209,7 @@ class Robot:
             raw.robot_address = _encode(config.robot_address)
             raw.mode = _encode(config.mode)
             raw.enable_scouting = 1 if config.enable_scouting else 0
-            raw.ns = _encode(config.ns)
+            raw.namespace_ = _encode(config.namespace)
             raw.log_level = _encode(config.log_level)
         handle = lib.shidou_create(ctypes.byref(raw))
         if not handle:
@@ -321,19 +319,32 @@ class Robot:
 
     # -- FSM handshakes ----------------------------------------------------
 
-    def set_namespace(self, ns):
+    def set_namespace(self, namespace):
         """Rebuilds the comm objects under a new keyexpr prefix.
 
         Call only with no other operation on this robot in flight; the
         telemetry cache is cleared on success.
         """
-        rc = self._call(lib.shidou_set_namespace, _encode(ns) or b"")
+        rc = self._call(lib.shidou_set_namespace, _encode(namespace) or b"")
         if rc != 0:
             raise ShidouError(self.last_error())
 
-    def enable(self, timeout_ms=-1):
-        """Handshake to ENABLED; timeout_ms < 0 uses the SDK default (5 s)."""
-        rc = self._call(lib.shidou_enable, timeout_ms)
+    def enable(self, mode=None, timeout_ms=-1):
+        """Handshake to ENABLED (damping hold).
+
+        The damping hold never enters a mode state: reaching MIT, CSP or PP
+        takes set_mode(). While a mode is still moving the robot answers
+        rejected_moving and the SDK resends until the timeout.
+
+        mode attaches a mode token to the enable request. The robot does not
+        read that field (its receipt says the mode was ignored), so this
+        lands in ENABLED as well; it is the same edge, not a mode switch.
+        timeout_ms < 0 uses the SDK default (5 s).
+        """
+        if mode is None:
+            rc = self._call(lib.shidou_enable, timeout_ms)
+        else:
+            rc = self._call(lib.shidou_enable_mode, int(mode), timeout_ms)
         if rc != 0:
             raise ShidouError(self.last_error())
 
@@ -344,64 +355,16 @@ class Robot:
             raise ShidouError(self.last_error())
 
     def set_mode(self, mode, timeout_ms=-1):
-        """Switches the control mode; requires ENABLED on the robot side."""
-        rc = self._call(lib.shidou_set_mode, int(mode), timeout_ms)
-        if rc != 0:
-            raise ShidouError(self.last_error())
+        """Switches the control mode and waits for its state.
 
-    def upload_trajectory(self, joint_id, mit_points=None, csp_points=None,
-                          frame_id="", stamp_sec=0, stamp_nanosec=0, timeout_ms=-1):
-        """Uploads a trajectory; raises unless the robot accepted it.
-
-        Waypoint arrays are index-aligned with joint_id. Fill the list that
-        matches the drives (MIT or CSP); the other one stays empty, and both
-        take the message's field order (mit_points first). Pass the waypoints
-        by keyword: the two lists mean different things and are the same
-        shape, so a positional call is easy to get wrong.
+        The robot queues the switch until the current motion settles. The
+        switch stops the drives, writes their control mode and re-enables
+        them (a drive only accepts a new mode while disabled), so the arm
+        briefly loses torque. In STOP it answers busy: this call never
+        enables the arm - call enable() first. timeout_ms < 0 uses the SDK
+        default (10 s).
         """
-        trajectory = _abi.new(_abi.ShidouTrajectory)
-        trajectory.frame_id = _encode(frame_id) or b""
-        trajectory.stamp_sec = stamp_sec
-        trajectory.stamp_nanosec = stamp_nanosec
-        # The C side reads these arrays during the call; keeping them in
-        # `alive` holds the buffers until it returns.
-        alive = []
-        ids, trajectory.joint_id_len = _abi.array(joint_id, ctypes.c_uint32)
-        trajectory.joint_id = ids
-        alive.append(ids)
-
-        if mit_points:
-            structs = (_abi.ShidouMitWaypoint * len(mit_points))()
-            for index, point in enumerate(mit_points):
-                item = _abi.new(_abi.ShidouMitWaypoint)
-                item.positions, item.positions_len = _abi.array(point.positions, ctypes.c_double)
-                item.velocities, item.velocities_len = _abi.array(point.velocities, ctypes.c_double)
-                item.torques, item.torques_len = _abi.array(point.torques, ctypes.c_double)
-                item.stop_point = 1 if point.stop_point else 0
-                structs[index] = item
-                alive.extend([item.positions, item.velocities, item.torques])
-            trajectory.mit_points = structs
-            trajectory.mit_points_len = len(mit_points)
-            alive.append(structs)
-
-        if csp_points:
-            structs = (_abi.ShidouCspWaypoint * len(csp_points))()
-            for index, point in enumerate(csp_points):
-                item = _abi.new(_abi.ShidouCspWaypoint)
-                item.positions, item.positions_len = _abi.array(point.positions, ctypes.c_double)
-                item.max_velocity, item.max_velocity_len = _abi.array(point.max_velocity,
-                                                                      ctypes.c_double)
-                item.max_acceleration, item.max_acceleration_len = _abi.array(
-                    point.max_acceleration, ctypes.c_double)
-                item.torques, item.torques_len = _abi.array(point.torques, ctypes.c_double)
-                structs[index] = item
-                alive.extend([item.positions, item.max_velocity, item.max_acceleration,
-                              item.torques])
-            trajectory.csp_points = structs
-            trajectory.csp_points_len = len(csp_points)
-            alive.append(structs)
-
-        rc = self._call(lib.shidou_upload_trajectory, ctypes.byref(trajectory), timeout_ms)
+        rc = self._call(lib.shidou_set_mode, int(mode), timeout_ms)
         if rc != 0:
             raise ShidouError(self.last_error())
 

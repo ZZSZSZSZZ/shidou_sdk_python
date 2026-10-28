@@ -10,9 +10,10 @@ shidou/                    # Python 包；_lib/<platform>/ 下是随包的预编
   _lib/linux-arm64/        # aarch64（同上）：同上
   _lib/win/                # Windows x64：shidou_py.dll + zenohc.dll
   _lib/win-arm64/          # Windows ARM64：同上
-examples/                  # 控制示例（get_state / get_joint / set_fsm /
-                           # mit_control / pushrod_control / chassis_control）
+examples/                  # 控制示例（get_state / get_joint / set_fsm / mit_control /
+                           # pp_control / pushrod_control / chassis_control）
 pyproject.toml             # 打包元数据（pip 用）
+GETTING_STARTED.md         # 快速上手：按顺序跑通七个示例
 ```
 
 ## 安装
@@ -63,36 +64,50 @@ Windows 上同理先 `python -m pip install -U pip`（新安装包自带的 pip 
 python3 examples/get_state.py 192.168.168.168:7447 robot168
 ```
 
+它只查询状态、不下发任何目标。第一次上手建议按这个顺序，前两个不会让机器人产生运动：
+
+1. `get_state`：只查询状态，确认地址与 namespace；
+2. `set_fsm`：看清 STOP 与 ENABLED 的区别，切换本身不产生运动；
+3. `pp_control`：第一次运动，每条臂的末端电机走 `+0.3 rad` 再回到原位；
+4. `mit_control`（仅灵足臂）/ `pushrod_control` / `chassis_control`：按机型选一个。
+
+每一步的讲解、输出对照与常见问题见 [GETTING_STARTED.md](GETTING_STARTED.md)。
+
 共同约定：
 
-- 参数顺序固定：示例自身的参数在前，`[<ip>:<port>]` 与 `[namespace]` 在后，两者均可省略。
-- 缺省 `robot_address` 为 `192.168.168.168:7447`，缺省 namespace 为 `robot168`。namespace
-  与桥不一致时示例等不到样本并报 `[FAIL]`；桥未启用 namespace 时传空串：
+- 示例接受两个可选参数：`[<ip>:<port>]` 与 `[namespace]`；示例自身的参数（如
+  `pushrod_control` 的 `[target_mm]`）在前。省略时使用缺省值。
+- 出厂默认 `robot_address` 为 `192.168.168.168:7447`，出厂默认 namespace 为 `robot168`。namespace
+  与桥不一致时示例收不到数据；桥未启用 namespace 时传空串：
   `python3 examples/set_fsm.py <ip>:<port> ""`。
 - `<ip>:<port>` 为机器人侧 zenoh 桥的监听地址与端口。
-- 输出行前缀统一：`[PASS]` 为判定通过，`[FAIL]` 为判定失败，另有 `[WARN]` / `[INFO]` 提示；
-  退出码 0 表示示例的所有判定均通过。
-- 每个示例都带 `--help`，可以先看用法再决定是否运行。
+- 示例不带 `--help`，只演示功能本身；参数顺序以上表与源码为准。
+- 运动示例运行即下发目标，不做回车确认；运行前请确保机器人周围安全。
 
-| 示例 | 作用 | 用法 | 回车确认 | 预期输出 |
-| --- | --- | --- | --- | --- |
-| `get_state` | 一次取回机器人状态并逐字段打印 | `get_state [<ip>:<port>] [namespace]` | 否 | 状态字段与各电机位置，末行 `[PASS] get_state completed` |
-| `get_joint` | 订阅关节遥测，每 500 ms 打印一帧快照 | `get_joint [seconds] [<ip>:<port>] [namespace]` | 否 | 周期快照与速率统计，末行 `[PASS] get_joint completed`；样本断流时快照带 STALE 并出现 `[WARN]` |
-| `set_fsm` | 在 STOP 与 ENABLED 之间切换 | `set_fsm [<ip>:<port>] [namespace]` | 每次回车切换一次，Ctrl+C 退出 | 每次切换打印 `[PASS] <动作> -> fsm_state=<新状态>` |
-| `mit_control` | 对每臂末端电机做 MIT 位置扫动：查询状态 → 必要时 Enable → `set_mode(POSITION)` → 以 100 Hz 下发 → 切回 ENABLED | `mit_control [<ip>:<port>] [namespace]` | 否 | 各段位置/速度打印，末行 `[PASS] Enable -> fsm_state=ENABLED` |
-| `pushrod_control` | 使能模式下把顶杆送到目标位置（mm），并按反馈判定到位 | `pushrod_control [target_mm] [<ip>:<port>] [namespace]` | 是（先打印计划） | `[PASS] pushrod <起点> mm -> <目标> mm (measured <实测> mm)` |
-| `chassis_control` | 驱动轮组正转 → 停 → 反转，每段按容差判定，末尾停发一段验证 500 ms 死区 | `chassis_control [<ip>:<port>] [namespace]` | 是（先打印计划） | 各段轮速打印，结束切回 ENABLED 打印 `[PASS] Enable -> fsm_state=ENABLED`；轮速未达容差时追加 `[FAIL] wheel velocities off target` |
+| 示例 | 作用 | 用法 |
+| --- | --- | --- |
+| `get_state` | 一次取回机器人状态并逐字段打印 | `get_state [<ip>:<port>] [namespace]` |
+| `get_joint` | 每 500 ms 打印一帧关节反馈，共 10 帧、5 秒；逐电机打印位置、速度、力矩、使能、在线、报警码与温度 | `get_joint [<ip>:<port>] [namespace]` |
+| `set_fsm` | 打印当前状态，演示 Enable 与 Stop | `set_fsm [<ip>:<port>] [namespace]` |
+| `mit_control` | 每臂末端电机做 MIT 位置来回：当前位置 → `+0.3 rad` → 原位（各 1 秒，100 Hz） | `mit_control [<ip>:<port>] [namespace]` |
+| `pp_control` | 每臂末端电机做 PP（轮廓位置）来回：当前位置 → `+0.3 rad` → 原位（每程只发一帧终点位置） | `pp_control [<ip>:<port>] [namespace]` |
+| `pushrod_control` | 使能模式下把顶杆送到目标位置（mm），随后打印 5 秒位置反馈 | `pushrod_control [target_mm] [<ip>:<port>] [namespace]` |
+| `chassis_control` | 轮组正转 2 秒 → 停 1.5 秒 → 反转 2 秒，结束后切回 ENABLED | `chassis_control [<ip>:<port>] [namespace]` |
 
 补充说明：
 
-- `get_joint` 的 `[seconds]` 为 0 或负数表示一直运行到进程被杀，适合在机器人旁长期挂监控。
-- `pushrod_control` 的 `[target_mm]` 缺省 0（即零点）；顶杆反馈随 `joint_states` 到达，示例按
-  `motor_id` 从中取顶杆位置，因此顶杆未上线时会报 `[FAIL] no position for pushrod motor ...`。
+- `pushrod_control` 的 `[target_mm]` 缺省 0（即零点）；目标只下发一帧，机器人端按
+  20 mm/s、50 mm/s² 的轮廓执行。示例不对到位做判定。
 - `chassis_control` 在段内按固定周期持续下发轮速：机器人侧 500 ms 收不到新消息就把轮速归零，
   发一帧就等不会产生运动。
-- 需要回车确认的两个示例在动作前打印动作计划；stdin 关闭或 Ctrl+C 视为放弃，不发送任何目标。
-- `mit_control` / `pushrod_control` / `chassis_control` 会下发模式切换与运动目标，确认计划前请
-  确保机器人周围安全。
+- 关节目标只在对应的模式态（MIT / CSP / PP）生效，目标不会切换模式；模式切换用 `set_mode`
+  （机器人端 `run_command` 服务；切换时机器人先停驱动、写电机模式、再重新使能，机械臂短暂
+  失去力矩；STOP 下先 `enable()`）。`enable` 进入的 ENABLED 是阻尼保持，`enable(mode)` 也
+  一样（机器人不读 `enable` 的模式字段）。能力按臂型裁剪：
+  灵足支持 mit / csp / pp，EYOU 支持 csp / pp，不支持的模式会被拒绝（`unsupported_mode`）。
+  `pp_control` 用的 PP 两族臂都支持（`mit_control` 只适用于灵足臂）。
+- `mit_control` / `pp_control` / `pushrod_control` / `chassis_control` 会下发模式切换与运动目标，
+  运行前请确保机器人周围安全。
 
 ## 在你的工程中使用
 
@@ -100,13 +115,13 @@ python3 examples/get_state.py 192.168.168.168:7447 robot168
 import shidou
 
 shidou.init_logging("info")
-# ns 必须与机器人侧桥配置的 namespace 完全一致；桥未启用时显式传 ""
-config = shidou.Config(robot_address="192.168.168.168:7447", ns="robot168")
+# namespace 必须与机器人侧桥配置完全一致；桥未启用时显式传 ""
+config = shidou.Config(robot_address="192.168.168.168:7447", namespace="robot168")
 
 robot = shidou.Robot(config)                    # 句柄生命周期见「注意事项」
-robot.enable()                                  # ENABLED 握手（阻塞）
-robot.set_mode(shidou.ControlMode.POSITION)     # 模式命令要求已 ENABLED
-robot.send_position(motor_ids=[1, 2], positions=[0.1, 0.1])
+robot.enable()                                  # 进入 ENABLED 阻尼保持（阻塞）
+robot.set_mode(shidou.ControlMode.PP)           # 切 PP：停驱动→写电机模式→重新使能（阻塞）
+robot.send_position(motor_ids=[1, 2], positions=[0.1, 0.1])   # 流式目标，PP 态才生效
 
 state = robot.get_state()                       # 阻塞，失败抛 ShidouError
 print(state.fsm_state, state.motor_ids, state.positions)
@@ -115,12 +130,12 @@ robot.close()                                   # 释放该句柄打开的会话
 ```
 
 接口与 C++ SDK 同名同义：`send_mit` / `send_csp` / `send_position` / `send_gripper` /
-`send_body` 非阻塞、线程安全、返回 `True/False`；`enable` / `stop` / `set_mode` /
-`upload_trajectory` / `set_namespace` 阻塞、失败抛 `ShidouError`；遥测是
+`send_body` 非阻塞、线程安全、返回 `True/False`；`enable` / `enable(mode)` / `stop` /
+`set_mode` / `set_namespace` 阻塞、失败抛 `ShidouError`（`enable(mode)` 与 `enable`
+是同一条使能边，机器人不读模式字段，落点仍是 ENABLED；进入模式态用 `set_mode`）；遥测是
 `last_feedback()` 与 `feedback_age_ms` / `feedback_seq` / `fsm_state` 快照；
 回调是 `set_feedback_callback` / `set_fsm_callback` / `set_stale_callback`（传 `None`
-注销）；轨迹路点用 `shidou.MITWaypoint` / `shidou.CSPWaypoint`。`Config` 的字段传
-`None` 表示沿用 SDK 默认值。
+注销）。`Config` 的字段传 `None` 表示沿用 SDK 默认值。
 
 回调在 zenoh 会话线程上触发，禁止阻塞（ctypes 进入回调时自动取 GIL，可以正常写 Python）：
 
@@ -155,10 +170,9 @@ robot.set_stale_callback(lambda age_ms: print("stale", age_ms), threshold_ms=100
   已无操作，随时可调）。连不上不是异常：构造交回的句柄 `ready` 为假，`last_error()` 就是
   原因（会话打不开给会话自己的原因，通信对象建不起来给 `failed to create comm objects: …`），
   日志里另有同一原因的 error 行
-- 阻塞方法要等满超时（enable/stop 5 s、mode 2 s、`get_state` 5 s、轨迹 10 s），且只能
-  从非回调线程调用；回调里只做拷贝与标记，动作交给主线程
-- `send_*` 与轨迹路点的数组要和 `motor_ids`（或 `joint_id`）逐位对齐，可选数组要么
-  省略、要么等长；两种路点形状相同，一律用关键字传（`mit_points=` / `csp_points=`）
+- 阻塞方法要等满超时（enable/stop 5 s（`enable(mode)` 同）、set_mode 10 s、
+  `get_state` 5 s），且只能从非回调线程调用；回调里只做拷贝与标记，动作交给主线程
+- `send_*` 的数组要和 `motor_ids` 逐位对齐，可选数组要么省略、要么等长
 - `get_state()` 与 `last_feedback()` 的电机顺序**可以不同**（真机实测一个给 `[14, 1, …,
   13]`、另一个给 `[1, 2, …, 14]`），跨来源一律按 `motor_ids` 对齐
 - 版本对应 tag；Release 页提供该版本树的 tar.gz / zip 归档

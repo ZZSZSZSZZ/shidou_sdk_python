@@ -1,37 +1,23 @@
-# MIT 目标流示例：本示例演示如何使用SDK按臂布局对 MIT 关节做位置扫动。
-# 流程：get_state() 查询状态 → 不在 ENABLED 则先 enable() → set_mode(POSITION)
-# → 以 100 Hz 下发 send_mit() → 扫动结束切回 ENABLED。
-# 扫动电机取每臂末端，电机号由 arm_info 的自由度得出（左臂 = dof，右臂 = dof + 7）；
-# 单臂扫动一个电机，双臂依次扫动（先左后右）。
-# 每个电机从当前位置出发，直线插值走三段：当前位置 → 0.3 (1 秒) → -0.3 (1 秒) → 0 (1 秒)。
-# send_mit() 字段：positions 为目标角，velocities 为速度前馈（取段内斜率），kps/kds 为
-# 关节刚度/阻尼（示例值），torques 留空即前馈力矩 0。
-# 注意：模式命令只能从 ENABLED 发起（STOP 状态只接受 enable），切 POSITION 前先确认
-# 当前状态；扫动结束切回 ENABLED。
+# MIT 关节示例：每条臂的末端电机从当前位置走一个来回（+0.3 rad 再回原位），
+# 100 Hz 下发 MIT 目标（位置 + 速度前馈 + 刚度/阻尼）。
+# MIT 目标只在 FSM 处于 MIT 态时被接受，模式由 set_mode(MIT) 切换；灵足臂支持
+# MIT，EYOU 臂请用 pp_control。
+#
+# 流程：查询状态与臂型 → 进入 MIT → 逐电机扫动 → 切回 ENABLED。
 #
 # 用法：mit_control.py [<ip>:<port>] [namespace]
-# namespace 须与机器人侧桥配置的 namespace 完全一致（缺省 robot168）；桥未启用
-# namespace 时显式传空串：mit_control.py <ip>:<port> ""
-# 用法与缺省值也可以直接问示例：mit_control.py --help
-#
-# 本示例会下发模式切换与运动目标：没有确认提示，运行即动作，先确保机器人周围安全。
-# 句柄不显式关闭，进程退出时随进程回收；需要提前释放时可正常 close()/with（v1.0.1 起，
-# 此前版本的例外说明见 README）。
 
 import sys
 import time
 
-import example_common as common
 import shidou
 
-PERIOD_S = 0.01          # 100 Hz 下发
-SEGMENT_SECONDS = 1.0    # 每段 1 秒
-WAYPOINT_HIGH = 0.3      # 第一段终点 rad
-WAYPOINT_LOW = -0.3      # 第二段终点 rad
-WAYPOINT_HOME = 0.0      # 回零目标 rad
-GAIN_KP = 40.0           # 关节刚度（示例值，可按需调整）
-GAIN_KD = 2.0            # 关节阻尼（示例值，可按需调整）
-FSM_ENABLED = "ENABLED"
+PERIOD_S = 0.01          # 目标下发周期：10 ms = 100 Hz
+STEPS = 100              # 单程步数；100 步 × 10 ms = 1 秒
+SEGMENT_SECONDS = 1.0    # 单程时长 s，须与步数 × 周期一致
+AMPLITUDE = 0.3          # 单程摆幅 rad（示例值，可按需调整）
+GAIN_KP = 40.0           # 关节刚度（示例值）
+GAIN_KD = 2.0            # 关节阻尼（示例值）
 
 
 def parse_dof(text):
@@ -45,102 +31,74 @@ def parse_dof(text):
 
 
 def parse_arm_layout(arm_info):
-    """解析 arm_info（"{构型}_{自由度}"，构型段为 left / right / dual）。
-
-    返回 (has_left, has_right, left_dof, right_dof)；没有可识别的构型段或自由度
-    段非法时返回 None。非构型段跳过，不解析其后的段。
-    """
+    """解析 arm_info 里的构型段：left_7 / right_7 / dual_5x7；旧版机器人还会带
+    电机家族前缀（如 EYOU_left_7），非构型段跳过。返回 (has_left, has_right,
+    left_dof, right_dof)，解析失败返回 None。"""
     segments = arm_info.split("_")
     for index in range(len(segments) - 1):
-        layout = segments[index]
-        if layout not in ("left", "right", "dual"):
+        side = segments[index]
+        if side not in ("left", "right", "dual"):
             continue
         dof = parse_dof(segments[index + 1])
         if dof is None:
             return None
         left_dof, right_dof = dof
-        has_left = layout in ("left", "dual")
-        has_right = layout in ("right", "dual")
+        has_left = side in ("left", "dual")
+        has_right = side in ("right", "dual")
         return (has_left, has_right,
                 left_dof if has_left else 0, right_dof if has_right else 0)
     return None
 
 
-def current_position(state, motor_id, verdicts):
-    """从 get_state 快照中找电机当前位置；快照没有该电机时回退 0 并告警。"""
+def current_position(state, motor_id):
+    """从 get_state 快照中找电机当前位置；快照没有该电机时回退 0。"""
     for index, motor in enumerate(state.motor_ids):
         if motor == motor_id and index < len(state.positions):
             return state.positions[index]
-    verdicts.warn("motor {} not in get_state snapshot, sweep from 0".format(motor_id))
+    print("motor {} not in get_state snapshot, sweep from 0".format(motor_id))
     return 0.0
 
 
-def sweep_motor(robot, verdicts, motor_id, start):
-    """单电机三段直线插值扫动：start → 0.3 (1 s) → -0.3 (1 s) → 0 (1 s)。
-
-    段内以实际经过时间为插值变量，睡眠抖动不累积；velocity 取段内斜率做速度前馈，
-    kp/kd 固定为示例值。每段结束补发终点帧（速度前馈清零），保证段间衔接与最终
-    停位精确。
-    """
-    waypoints = [start, WAYPOINT_HIGH, WAYPOINT_LOW, WAYPOINT_HOME]
-    print("motor {}: {:.3f} -> {:.3f} -> {:.3f} -> {:.3f} ({:.0f} s per segment)".format(
-        motor_id, waypoints[0], waypoints[1], waypoints[2], waypoints[3], SEGMENT_SECONDS))
-    for segment in range(len(waypoints) - 1):
-        begin = waypoints[segment]
-        end = waypoints[segment + 1]
-        slope = (end - begin) / SEGMENT_SECONDS  # 段内速度前馈 rad/s
-        segment_start = time.monotonic()
-        while True:
-            elapsed = time.monotonic() - segment_start
-            if elapsed >= SEGMENT_SECONDS:
-                break
+def sweep_motor(robot, motor_id, start):
+    """单电机来回扫动：start → start + AMPLITUDE → start，每程 STEPS 步线性插值，
+    速度前馈取段内斜率；每程末尾补发一帧终点并把速度前馈清零，避免机器人端按
+    残余前馈继续推进。失败返回 1，错误消息已打印。"""
+    peak = start + AMPLITUDE
+    print("motor {}: {:.3f} -> {:.3f} -> {:.3f} ({:.0f} s each way)".format(
+        motor_id, start, peak, start, SEGMENT_SECONDS))
+    for begin, end in ((start, peak), (peak, start)):
+        # 段内按比例细分目标位置；velocity 是该段的平均速度，作为前馈下发。
+        velocity = (end - begin) / SEGMENT_SECONDS
+        for step in range(1, STEPS + 1):
             # torques 不填 = 前馈力矩 0。
             if not robot.send_mit(motor_ids=[motor_id],
-                                  positions=[begin + (end - begin) * (elapsed / SEGMENT_SECONDS)],
-                                  velocities=[slope],
-                                  kps=[GAIN_KP], kds=[GAIN_KD]):
-                # send_* 失败返回 False（不抛异常）；失败后 last_error() 是本次调用的消息。
-                verdicts.fail("publish motor {} failed: {}".format(motor_id, robot.last_error()))
-                return False
+                                  positions=[begin + (end - begin) * step / STEPS],
+                                  velocities=[velocity], kps=[GAIN_KP], kds=[GAIN_KD]):
+                print("send_mit: {}".format(robot.last_error()))
+                return 1
             time.sleep(PERIOD_S)
+        # 终点帧：位置停在 end，速度前馈清零。
         if not robot.send_mit(motor_ids=[motor_id], positions=[end], velocities=[0.0],
                               kps=[GAIN_KP], kds=[GAIN_KD]):
-            verdicts.fail("publish motor {} failed: {}".format(motor_id, robot.last_error()))
-            return False
-    return True
+            print("send_mit: {}".format(robot.last_error()))
+            return 1
+    return 0
 
 
-def sweep_joints(robot, cfg, verdicts):
-    """扫动流程：查状态 → 必要时 Enable → 解析臂布局 → 切 POSITION → 依次扫动 → 切回 ENABLED。"""
-    # 先查状态：arm_info 决定扫动电机，fsm_state 决定是否需要先 Enable。
-    try:
-        state = robot.get_state()
-    except shidou.ShidouError as error:
-        verdicts.fail("get_state: {}".format(error))
-        shidou.shutdown()
-        return
+def sweep_joints(robot):
+    state = robot.get_state()
     print("arm_info={}".format(state.arm_info))
     print("fsm_state={}".format(state.fsm_state))
 
-    # 模式命令只能从 ENABLED 发起（STOP 态只接受 enable，不能直接切模式），
-    # 当前不在 ENABLED 时先使能握手。
-    if state.fsm_state != FSM_ENABLED:
-        try:
-            robot.enable()
-        except shidou.ShidouError as error:
-            verdicts.fail("enable: {}".format(error))
-            shidou.shutdown()
-            return
-        print("fsm_state={}".format(robot.fsm_state))
-
+    # arm_info 决定哪几条臂参与扫动，以及各自的末端电机号。
     layout = parse_arm_layout(state.arm_info)
     if layout is None:
-        verdicts.fail("arm_info={}: cannot parse layout/dof".format(state.arm_info))
-        shidou.shutdown()
-        return
+        print("arm_info={}: cannot parse layout/dof".format(state.arm_info))
+        return 1
     has_left, has_right, left_dof, right_dof = layout
-    layout_name = "dual" if has_left and has_right else ("left" if has_left else "right")
-    print("arm layout: {} (left dof={}, right dof={})".format(layout_name, left_dof, right_dof))
+    print("arm layout: {} (left dof={}, right dof={})".format(
+        "dual" if has_left and has_right else ("left" if has_left else "right"),
+        left_dof, right_dof))
 
     # 末端电机号由自由度得出：左 = dof、右 = dof + 7；双臂依次（先左后右）。
     motors = []
@@ -149,34 +107,35 @@ def sweep_joints(robot, cfg, verdicts):
     if has_right:
         motors.append(right_dof + 7)
 
-    # MIT 目标由 POSITION 状态消费：先切入 POSITION 模式，确认后开始扫动。
-    try:
-        robot.set_mode(shidou.ControlMode.POSITION)
-    except shidou.ShidouError as error:
-        verdicts.fail("set_mode(POSITION): {}".format(error))
-        shidou.shutdown()
-        return
-    print("fsm_state={}, sweeping {} motor(s)".format(robot.fsm_state, len(motors)))
+    # STOP 下 set_mode 回 busy，先使能。
+    if state.fsm_state == "STOP":
+        robot.enable()
+    # 切到 MIT：机器人先停驱动再重新使能，期间短暂失力。
+    robot.set_mode(shidou.ControlMode.MIT)
+    # 状态由 set_mode 回执后刷新，确认已进入 MIT。
+    print("fsm_state={}".format(robot.fsm_state))
 
     for motor_id in motors:
-        if not sweep_motor(robot, verdicts, motor_id, current_position(state, motor_id, verdicts)):
-            shidou.shutdown()
-            return
+        if sweep_motor(robot, motor_id, current_position(state, motor_id)) != 0:
+            return 1
 
-    # 扫动结束切回 ENABLED，机器人回到可再次接收模式命令的状态。
-    try:
-        robot.enable()
-    except shidou.ShidouError as error:
-        shidou.shutdown()
-        verdicts.fail("enable: {}".format(error))
-        return
-    shidou.shutdown()
-    verdicts.pass_("Enable -> fsm_state={}".format(robot.fsm_state))
+    # 回到 ENABLED；未停稳时 enable 自动重发。
+    robot.enable()
+    # 打印最终状态，确认回到 ENABLED。
+    print("fsm_state={}".format(robot.fsm_state))
+    return 0
 
 
 def main():
-    # MIT 扫动没有自己的参数：位置参数只有 [<ip>:<port>] 与 [namespace]。
-    return common.run([], sweep_joints)
+    address = sys.argv[1] if len(sys.argv) > 1 else "192.168.168.168:7447"
+    namespace = sys.argv[2] if len(sys.argv) > 2 else "robot168"
+
+    shidou.init_logging("info")
+    robot = shidou.Robot(shidou.Config(robot_address=address, namespace=namespace))
+    if not robot.ready:
+        print(robot.last_error())
+        return 1
+    return sweep_joints(robot)
 
 
 if __name__ == "__main__":

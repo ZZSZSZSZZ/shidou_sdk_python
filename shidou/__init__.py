@@ -7,16 +7,13 @@ here, at import, rather than mid-call. The public surface is the names below;
 see python/README.md for usage and contracts.
 """
 
-from .robot import (CSPWaypoint, Config, ControlMode, JointFeedback,
-                    MITWaypoint, Robot, RobotState, ShidouError,
-                    init_logging, shutdown)
+from .robot import (Config, ControlMode, JointFeedback, Robot, RobotState,
+                    ShidouError, init_logging, shutdown)
 
 __all__ = [
-    "CSPWaypoint",
     "Config",
     "ControlMode",
     "JointFeedback",
-    "MITWaypoint",
     "Robot",
     "RobotState",
     "ShidouError",

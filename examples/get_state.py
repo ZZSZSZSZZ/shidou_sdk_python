@@ -1,29 +1,30 @@
-# 状态查询示例：本示例演示如何使用SDK查询机器人状态。
-# 用 get_state() 一次取回状态，逐字段打印。
+# 只读示例：查询一次机器人状态并逐字段打印，用于确认地址、namespace 与机器人端
+# 桥是否对得上（FSM 状态、臂型/机身构型、电机列表、最近一帧遥测的年龄）。
+# 不下发任何目标。
+#
+# 流程：构造 Robot（自开会话）→ get_state 服务查询 → 逐字段打印。
 #
 # 用法：get_state.py [<ip>:<port>] [namespace]
-# namespace 须与机器人侧桥配置的 namespace 完全一致（缺省 robot168）；桥未启用
-# namespace 时显式传空串：get_state.py <ip>:<port> ""
-# 用法与缺省值也可以直接问示例：get_state.py --help
-#
-# 句柄不显式关闭，进程退出时随进程回收；需要提前释放时可正常 close()/with（v1.0.1 起，
-# 此前版本的例外说明见 README）。
 
 import sys
 
-import example_common as common
 import shidou
 
 
-def query_state(robot, cfg, verdicts):
-    """取一次状态并逐字段打印。"""
-    # get_state 返回服务字段与遥测缓存的合并结果；反馈字段来自遥测快照。
-    try:
-        state = robot.get_state()
-    except shidou.ShidouError as error:
-        verdicts.fail("get_state: {}".format(error))
-        return
+def main():
+    # 可选参数：机器人地址与 namespace，省略时用出厂默认值。
+    address = sys.argv[1] if len(sys.argv) > 1 else "192.168.168.168:7447"
+    # namespace 必须与机器人侧桥配置完全一致；桥未启用 namespace 时传空串。
+    namespace = sys.argv[2] if len(sys.argv) > 2 else "robot168"
 
+    shidou.init_logging("info")
+    robot = shidou.Robot(shidou.Config(robot_address=address, namespace=namespace))
+    if not robot.ready:
+        print(robot.last_error())
+        return 1
+
+    # 服务查询：一次取回 FSM 状态、配置字段与最新遥测快照。
+    state = robot.get_state()
     print("fsm_state      : {}".format(state.fsm_state))
     print("arm_info       : {}".format(state.arm_info))
     print("gripper_info   : {}".format(state.gripper_info))
@@ -36,24 +37,24 @@ def query_state(robot, cfg, verdicts):
     print("cycle avg/max  : {:.2f} / {:.2f} ms".format(state.control_cycle_avg_ms,
                                                        state.control_cycle_max_ms))
     print("cycle overruns : {}".format(state.cycle_overruns))
+    # 电机列表与位置来自服务快照；顺序不保证与遥测一致，跨来源按 motor_ids 对齐。
+    # mode/confidence 也按 motor_ids 对齐，机器人不上报时显示 "-"；只有
+    # confirmed 表示设备确认处在所报模式，其余情况下设备可能仍停在旧模式。
     print("motors         : {}".format(len(state.motor_ids)))
     for index, motor_id in enumerate(state.motor_ids):
         position = state.positions[index] if index < len(state.positions) else 0.0
-        print("  motor {} pos={:.4f}".format(motor_id, position))
+        mode = state.control_mode[index] if index < len(state.control_mode) else "-"
+        confidence = (state.control_mode_confidence[index]
+                      if index < len(state.control_mode_confidence) else "-")
+        print("  motor {} pos={:.4f} mode={} confidence={}".format(
+            motor_id, position, mode, confidence))
     # 遥测快照：尚未收到样本时 has_feedback 为 false、age 为负。
     if state.has_feedback:
         print("feedback       : seq={} age={:.1f} ms".format(state.feedback_seq,
                                                              state.feedback_age_ms))
     else:
         print("feedback       : none yet")
-
-    shidou.shutdown()
-    verdicts.pass_("get_state completed")
-
-
-def main():
-    # 状态查询没有自己的参数：位置参数只有 [<ip>:<port>] 与 [namespace]。
-    return common.run([], query_state)
+    return 0
 
 
 if __name__ == "__main__":
